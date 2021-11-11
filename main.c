@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <uxtheme.h>
+#include <locale.h>
 #include <tchar.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -19,40 +21,51 @@
 #define WMU_UPDATE_GRID        WM_USER + 1
 #define WMU_UPDATE_CACHE       WM_USER + 2
 #define WMU_UPDATE_FILTER_SIZE WM_USER + 3
-#define WMU_AUTO_COLUMN_SIZE   WM_USER + 4
-#define WMU_RESET_CACHE        WM_USER + 5
-#define WMU_SET_FONT           WM_USER + 6
-#define WMU_ERROR_MESSAGE      WM_USER + 7
+#define WMU_SET_HEADER_FILTERS WM_USER + 4
+#define WMU_AUTO_COLUMN_SIZE   WM_USER + 5
+#define WMU_RESET_CACHE        WM_USER + 6
+#define WMU_SET_FONT           WM_USER + 7
+#define WMU_SET_THEME          WM_USER + 8
 
 #define IDC_MAIN               100
 #define IDC_TABLELIST          101
-#define IDC_DATAGRID           102
+#define IDC_GRID               102
 #define IDC_STATUSBAR          103
 #define IDC_HEADER_EDIT        1000
 
 #define IDM_COPY_CELL          5000
 #define IDM_COPY_ROW           5001
+#define IDM_FILTER_ROW         5002
+#define IDM_HEADER_ROW         5003
+#define IDM_DARK_THEME         5004
 
-#define SB_TABLE_COUNT         0
-#define SB_VIEW_COUNT          1
-#define SB_TYPE                2
-#define SB_ROW_COUNT           3
-#define SB_CURRENT_ROW         4
-#define SB_ERROR               5
-
+#define SB_VERSION             0
+#define SB_TABLE_COUNT         1
+#define SB_VIEW_COUNT          2
+#define SB_TYPE                3
+#define SB_ROW_COUNT           4
+#define SB_CURRENT_ROW         5
+#define SB_AUXILIARY           6
 
 #define SPLITTER_WIDTH         5
 #define MAX_TEXT_LENGTH        32000
 #define MAX_DATA_LENGTH        32000
+#define MAX_TABLE_LENGTH       2000
 #define MAX_COLUMN_LENGTH      2000
 #define MAX_ERROR_LENGTH       2000
 
+#define ODBC_UNKNOWN           0
 #define ODBC_ACCESS            1
 #define ODBC_EXCEL             2
 #define ODBC_EXCELX            3
-#define ODBC_CSV               4
 
 #define APP_NAME               TEXT("odbc-wlx")
+#define APP_VERSION            TEXT("0.9.3")
+
+#define LCS_FINDFIRST          1
+#define LCS_MATCHCASE          2
+#define LCS_WHOLEWORDS         4
+#define LCS_BACKWARDS          8
 
 typedef struct {
 	int size;
@@ -64,25 +77,37 @@ typedef struct {
 static TCHAR iniPath[MAX_PATH] = {0};
 
 LRESULT CALLBACK cbNewMain (HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK cbNewHeader(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK cbNewFilterEdit (HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK cbHotKey(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+HWND getMainWindow(HWND hWnd);
 void setStoredValue(TCHAR* name, int value);
 int getStoredValue(TCHAR* name, int defValue);
 TCHAR* getStoredString(TCHAR* name, TCHAR* defValue);
 int CALLBACK cbEnumTabStopChildren (HWND hWnd, LPARAM lParam);
 TCHAR* utf8to16(const char* in);
 char* utf16to8(const TCHAR* in);
+int findString(TCHAR* text, TCHAR* word, BOOL isMatchCase, BOOL isWholeWords);
 void setClipboardText(const TCHAR* text);
 BOOL isNumber(TCHAR* val);
 int ListView_AddColumn(HWND hListWnd, TCHAR* colName, int fmt);
 int Header_GetItemText(HWND hWnd, int i, TCHAR* pszText, int cchTextMax);
+void Menu_SetItemState(HMENU hMenu, UINT wID, UINT fState);
 
 BOOL APIENTRY DllMain (HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+	if (ul_reason_for_call == DLL_PROCESS_ATTACH && iniPath[0] == 0) {
+		TCHAR path[MAX_PATH + 1] = {0};
+		GetModuleFileName(hModule, path, MAX_PATH);
+		TCHAR* dot = _tcsrchr(path, TEXT('.'));
+		_tcsncpy(dot, TEXT(".ini"), 5);
+		if (_taccess(path, 0) == 0)
+			_tcscpy(iniPath, path);	
+	}
 	return TRUE;
 }
 
 void __stdcall ListGetDetectString(char* DetectString, int maxlen) {
-	snprintf(DetectString, maxlen, "MULTIMEDIA & (ext=\"MDB\" | ext=\"XLS\" | ext=\"XLSX\" | ext=\"XLSB\" | ext=\"CSV\" | ext=\"DSN\")");
+	snprintf(DetectString, maxlen, "MULTIMEDIA & (ext=\"MDB\" | ext=\"XLS\" | ext=\"XLSX\" | ext=\"XLSB\" | ext=\"XLSM\" | ext=\"DSN\")");
 }
 
 void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
@@ -92,45 +117,91 @@ void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
 	}
 }
 
-HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
-	DWORD size = MultiByteToWideChar(CP_ACP, 0, fileToLoad, -1, NULL, 0);
-	TCHAR* filepath = (TCHAR*)calloc (size, sizeof (TCHAR));
-	MultiByteToWideChar(CP_ACP, 0, fileToLoad, -1, filepath, size);
+int __stdcall ListSearchTextW(HWND hWnd, TCHAR* searchString, int searchParameter) {
+	HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+	HWND hStatusWnd = GetDlgItem(hWnd, IDC_STATUSBAR);	
+	
+	TCHAR*** cache = (TCHAR***)GetProp(hWnd, TEXT("CACHE"));
+	int rowCount = *(int*)GetProp(hWnd, TEXT("ROWCOUNT"));
+	int colCount = Header_GetItemCount(ListView_GetHeader(hGridWnd));
+		
+	BOOL isBackward = searchParameter & LCS_BACKWARDS;
+	BOOL isMatchCase = searchParameter & LCS_MATCHCASE;
+	BOOL isWholeWords = searchParameter & LCS_WHOLEWORDS;	
+		
+	int rowNo = ListView_GetNextItem(hGridWnd, -1, LVNI_SELECTED);
+	if (rowNo == -1)
+		rowNo = isBackward ? rowCount - 1 : 0;
+		
+	int* pColNo = (int*)GetProp(hWnd, TEXT("SEARCHCOLNO"));
 
-	int odbcType = ODBC_CSV;
+	int pos = -1;
+	do {
+		int colNo = *pColNo;
+		for (; (pos == -1) && colNo < colCount; colNo++) 
+			pos = findString(cache[rowNo][colNo], searchString, isMatchCase, isWholeWords);
+		*pColNo = pos != -1 ? colNo - 1 : 0;
+		rowNo += (pos == -1) && (isBackward ? -1 : 1); 	
+	} while ((pos == -1) && (isBackward ? rowNo > 0 : rowNo < rowCount - 1));
 
-	TCHAR* fileext = _tcsrchr(filepath, TEXT('.'));
+	TCHAR buf[256] = {0};
+	if (pos != -1) {
+		ListView_EnsureVisible(hGridWnd, rowNo, FALSE);
+		ListView_SetItemState(hGridWnd, rowNo, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+		
+		TCHAR colName[MAX_COLUMN_LENGTH + 1];
+		Header_GetItemText(ListView_GetHeader(hGridWnd), *pColNo, colName, MAX_COLUMN_LENGTH);
+		TCHAR* val = cache[rowNo][*pColNo];
+		int len = _tcslen(searchString);
+		_sntprintf(buf, 255, TEXT("%ls: %ls%.*ls%ls"), colName, 
+			pos >= 10 ? TEXT("...") : TEXT(""), 
+			len + (pos < 10 ? pos : 10) + 10, pos < 10 ? val : val + pos - 10,
+			_tcslen(val + pos + len) > 10 ? TEXT("...") : TEXT(""));
+		*pColNo += 1;
+	} else { 
+		MessageBox(hWnd, searchString, TEXT("Not found:"), MB_OK);
+	}
+	SendMessage(hStatusWnd, SB_SETTEXT, SB_AUXILIARY, (LPARAM)buf);	
+	SetFocus(hGridWnd);	
+
+	return 0;
+}
+
+int __stdcall ListSearchText(HWND hWnd, char* searchString, int searchParameter) {
+	DWORD len = MultiByteToWideChar(CP_ACP, 0, searchString, -1, NULL, 0);
+	TCHAR* searchString16 = (TCHAR*)calloc (len, sizeof (TCHAR));
+	MultiByteToWideChar(CP_ACP, 0, searchString, -1, searchString16, len);
+	int rc = ListSearchTextW(hWnd, searchString16, searchParameter);
+	free(searchString16);
+	return rc;
+}
+
+HWND APIENTRY ListLoadW (HWND hListerWnd, TCHAR* fileToLoad, int showFlags) {
+	TCHAR* fileext = _tcsrchr(fileToLoad, TEXT('.'));
 	_tcslwr(fileext);
 
-	int dlen = _tcslen(filepath);
-	while (dlen > 0 && filepath[dlen - 1] != TEXT('/') && filepath[dlen - 1] != TEXT('\\'))
-		dlen--;
+	TCHAR* dbpath = calloc(MAX_PATH, sizeof(TCHAR));
+	_tcsncpy(dbpath, fileToLoad, MAX_PATH);
 
+	int odbcType = ODBC_UNKNOWN;
 	TCHAR connectionString[MAX_TEXT_LENGTH] = {0};
-	TCHAR connectionString2[MAX_TEXT_LENGTH] = {0};
+	TCHAR connectionString2[MAX_TEXT_LENGTH] = {0};	 
 	if (_tcscmp(fileext, TEXT(".mdb")) == 0 || _tcscmp(fileext, TEXT(".accdb")) == 0) {
-		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Access Driver (*.mdb)};Dbq=%ls;Uid=Admin;Pwd=;ReadOnly=0;"), filepath);
-		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Access Driver (*.mdb, *.accdb)};Dbq=%ls;Uid=Admin;Pwd=;ReadOnly=0;"), filepath);
+		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Access Driver (*.mdb)};Dbq=%ls;Uid=Admin;Pwd=;ReadOnly=1;"), fileToLoad);
+		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Access Driver (*.mdb, *.accdb)};Dbq=%ls;Uid=Admin;Pwd=;ReadOnly=1;"), fileToLoad);
 		odbcType = ODBC_ACCESS;
 	} else if (_tcscmp(fileext, TEXT(".xls")) == 0) {
-		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls)};Dbq=%ls;ReadOnly=0;"), filepath);
-		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};Dbq=%ls;ReadOnly=0;"), filepath);
+		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls)};Dbq=%ls;ReadOnly=1;"), fileToLoad);
+		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};Dbq=%ls;ReadOnly=1;"), fileToLoad);
 		odbcType = ODBC_EXCEL;
-	} else if (_tcscmp(fileext, TEXT(".xlsx")) == 0 || _tcscmp(fileext, TEXT(".xlsb")) == 0) {
-		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};Dbq=%ls;ReadOnly=0;"), filepath);
-		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};Dbq=%ls;ReadOnly=0;"), filepath);
+	} else if (_tcscmp(fileext, TEXT(".xlsx")) == 0 || _tcscmp(fileext, TEXT(".xlsb")) == 0 || _tcscmp(fileext, TEXT(".xlsm")) == 0) {
+		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};Dbq=%ls;ReadOnly=1;"), fileToLoad);
+		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};Dbq=%ls;ReadOnly=1;"), fileToLoad);
 		odbcType = ODBC_EXCELX;
-	} else if (_tcscmp(fileext, TEXT(".csv")) == 0) {
-		TCHAR dir[MAX_PATH] = {0};
-		_tcsncpy(dir, filepath, dlen - 1);
-
-		_sntprintf(connectionString, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Text Driver (*.txt; *.csv)};Dbq=%ls;Extensions=asc,csv,tab,txt;ReadOnly=0;"), dir);
-		_sntprintf(connectionString2, MAX_TEXT_LENGTH, TEXT("Driver={Microsoft Access Text Driver (*.txt, *.csv)};Dbq=%ls; Extensions=asc,csv,tab,txt;ReadOnly=0;"), dir);
-		odbcType = ODBC_CSV;
 	} else if (_tcscmp(fileext, TEXT(".dsn")) == 0) {
 		TCHAR buf[32000];
 
-		int len = GetPrivateProfileString(TEXT("ODBC"), NULL, NULL, buf, 32000, filepath);
+		int len = GetPrivateProfileString(TEXT("ODBC"), NULL, NULL, buf, 32000, fileToLoad);
 		int start = 0;
 		for (int i = 0; i < len; i++) {
 			if (buf[i] != 0)
@@ -139,7 +210,7 @@ HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
 			TCHAR key[i - start + 1];
 			_tcsncpy(key, buf + start, i - start + 1);
 			TCHAR value[1024];
-			GetPrivateProfileString(TEXT("ODBC"), key, NULL, value, 1024, filepath);
+			GetPrivateProfileString(TEXT("ODBC"), key, NULL, value, 1024, fileToLoad);
 			TCHAR pair[2000];
 			BOOL isQ = _tcschr(value, TEXT(' ')) != 0;
 			_sntprintf(pair, 2000, TEXT("%ls=%ls%ls%ls;"), key, isQ ? TEXT("{") : TEXT(""), value, isQ ? TEXT("}") : TEXT(""));
@@ -150,7 +221,12 @@ HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
 			_tcslwr(key);
 			_tcslwr(value);
 			if (_tcscmp(key, TEXT("driver")) == 0)
-				odbcType = _tcsstr(value, TEXT("*.csv")) ? ODBC_CSV : _tcsstr(value, TEXT("*.mdb")) ? ODBC_ACCESS : ODBC_EXCEL;
+				odbcType = _tcsstr(value, TEXT("*.mdb")) ? ODBC_ACCESS : 
+					_tcsstr(value, TEXT("*.xls")) ? ODBC_EXCEL :
+					_tcsstr(value, TEXT("*.xlsx")) ? ODBC_EXCELX :					
+					ODBC_UNKNOWN;
+			if (_tcscmp(key, TEXT("dbq")) == 0)
+				_tcsncpy(dbpath, value, MAX_PATH);
 		}
 	}
 	SQLHANDLE hEnv = 0;
@@ -167,6 +243,7 @@ HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
 		MessageBox(hListerWnd, TEXT("Can't connect to database"), NULL, MB_OK);
 		SQLFreeHandle(SQL_HANDLE_DBC, hConn);
 		SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+		free(dbpath);
 		return 0;
 	}
 
@@ -174,52 +251,79 @@ HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
 	icex.dwSize = sizeof(icex);
 	icex.dwICC = ICC_LISTVIEW_CLASSES;
 	InitCommonControlsEx(&icex);
+	
+	setlocale(LC_CTYPE, "");
 
 	BOOL isStandalone = GetParent(hListerWnd) == HWND_DESKTOP;
-	HWND hMainWnd = CreateWindow(WC_STATIC, TEXT("odbc-wlx"), WS_CHILD | WS_VISIBLE | (isStandalone ? SS_SUNKEN : 0),
-		0, 0, 100, 100, hListerWnd, (HMENU)IDC_MAIN, GetModuleHandle(0), NULL);
-
+	HWND hMainWnd = CreateWindow(WC_STATIC, APP_NAME, WS_CHILD | (isStandalone ? SS_SUNKEN : 0),
+		0, 0, 100, 100, hListerWnd, (HMENU)IDC_MAIN, GetModuleHandle(0), NULL);	
+	
 	SetProp(hMainWnd, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hMainWnd, GWLP_WNDPROC, (LONG_PTR)&cbNewMain));
+	SetProp(hMainWnd, TEXT("FILTERROW"), calloc(1, sizeof(int)));	
+	SetProp(hMainWnd, TEXT("HEADERROW"), calloc(1, sizeof(int)));
 	SetProp(hMainWnd, TEXT("CACHE"), 0);
 	SetProp(hMainWnd, TEXT("ORDERBY"), calloc(1, sizeof(int)));
-	SetProp(hMainWnd, TEXT("TABLENAME"), calloc(1024, sizeof(TCHAR)));
+	SetProp(hMainWnd, TEXT("DBPATH"), dbpath);	
+	SetProp(hMainWnd, TEXT("TABLENAME"), calloc(MAX_TABLE_LENGTH, sizeof(TCHAR)));
 	SetProp(hMainWnd, TEXT("WHERE"), calloc(MAX_TEXT_LENGTH, sizeof(TCHAR)));
 	SetProp(hMainWnd, TEXT("ROWCOUNT"), calloc(1, sizeof(int)));
 	SetProp(hMainWnd, TEXT("TOTALROWCOUNT"), calloc(1, sizeof(int)));
 	SetProp(hMainWnd, TEXT("DBENV"), hEnv);
 	SetProp(hMainWnd, TEXT("DB"), hConn);
 	SetProp(hMainWnd, TEXT("COLNO"), calloc(1, sizeof(int)));
+	SetProp(hMainWnd, TEXT("SEARCHCOLNO"), calloc(1, sizeof(int)));
 	SetProp(hMainWnd, TEXT("ODBCTYPE"), calloc(1, sizeof(int)));
 	SetProp(hMainWnd, TEXT("SPLITTERPOSITION"), calloc(1, sizeof(int)));
 	SetProp(hMainWnd, TEXT("FONT"), 0);
 	SetProp(hMainWnd, TEXT("FONTFAMILY"), getStoredString(TEXT("font"), TEXT("Arial")));
 	SetProp(hMainWnd, TEXT("FONTSIZE"), calloc(1, sizeof(int)));	
-	SetProp(hMainWnd, TEXT("GRAYBRUSH"), CreateSolidBrush(GetSysColor(COLOR_BTNFACE)));
+	SetProp(hMainWnd, TEXT("FILTERALIGN"), calloc(1, sizeof(int)));	
 
+	SetProp(hMainWnd, TEXT("DARKTHEME"), calloc(1, sizeof(int)));			
+	SetProp(hMainWnd, TEXT("TEXTCOLOR"), calloc(1, sizeof(int)));
+	SetProp(hMainWnd, TEXT("BACKCOLOR"), calloc(1, sizeof(int)));
+	SetProp(hMainWnd, TEXT("FILTERTEXTCOLOR"), calloc(1, sizeof(int)));
+	SetProp(hMainWnd, TEXT("FILTERBACKCOLOR"), calloc(1, sizeof(int)));	
+	SetProp(hMainWnd, TEXT("SPLITTERCOLOR"), calloc(1, sizeof(int)));		
+
+	*(int*)GetProp(hMainWnd, TEXT("HEADERROW")) = getStoredValue(TEXT("header-row"), 1);
 	*(int*)GetProp(hMainWnd, TEXT("SPLITTERPOSITION")) = getStoredValue(TEXT("splitter-position"), 200);
 	*(int*)GetProp(hMainWnd, TEXT("FONTSIZE")) = getStoredValue(TEXT("font-size"), 16);
-	*(int*)GetProp(hMainWnd, TEXT("ODBCTYPE")) = odbcType;	
+	*(int*)GetProp(hMainWnd, TEXT("FILTERROW")) = getStoredValue(TEXT("filter-row"), 1);	
+	*(int*)GetProp(hMainWnd, TEXT("ODBCTYPE")) = odbcType;
+	*(int*)GetProp(hMainWnd, TEXT("DARKTHEME")) = getStoredValue(TEXT("dark-theme"), 0);
+	*(int*)GetProp(hMainWnd, TEXT("FILTERALIGN")) = getStoredValue(TEXT("filter-align"), 0);	
 
 	HWND hStatusWnd = CreateStatusWindow(WS_CHILD | WS_VISIBLE |  (isStandalone ? SBARS_SIZEGRIP : 0), NULL, hMainWnd, IDC_STATUSBAR);
-	int sizes[6] = {75, 150, 200, 400, 500, -1};
-	SendMessage(hStatusWnd, SB_SETPARTS, 6, (LPARAM)&sizes);
-
-	HWND hListWnd = CreateWindow(TEXT("LISTBOX"), NULL, WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP,
+	HDC hDC = GetDC(hMainWnd);
+	float z = GetDeviceCaps(hDC, LOGPIXELSX) / 96.0; // 96 = 100%, 120 = 125%, 144 = 150%
+	ReleaseDC(hMainWnd, hDC);
+	int sizes[7] = {35 * z, 110 * z, 180 * z, 225 * z, 420 * z, 500 * z, -1};
+	SendMessage(hStatusWnd, SB_SETPARTS, 7, (LPARAM)&sizes);
+	
+	HWND hListWnd = CreateWindow(TEXT("LISTBOX"), NULL, WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | WS_HSCROLL,
 		0, 0, 100, 100, hMainWnd, (HMENU)IDC_TABLELIST, GetModuleHandle(0), NULL);
 	SetProp(hListWnd, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hListWnd, GWLP_WNDPROC, (LONG_PTR)cbHotKey));	
 
-	HWND hDataWnd = CreateWindow(WC_LISTVIEW, NULL, WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | LVS_OWNERDATA | WS_TABSTOP,
-		205, 0, 100, 100, hMainWnd, (HMENU)IDC_DATAGRID, GetModuleHandle(0), NULL);
-	ListView_SetExtendedListViewStyle(hDataWnd, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_LABELTIP);
-	SetProp(hDataWnd, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hDataWnd, GWLP_WNDPROC, (LONG_PTR)cbHotKey));	
+	HWND hGridWnd = CreateWindow(WC_LISTVIEW, NULL, WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | LVS_OWNERDATA | WS_TABSTOP,
+		205, 0, 100, 100, hMainWnd, (HMENU)IDC_GRID, GetModuleHandle(0), NULL);
+	ListView_SetExtendedListViewStyle(hGridWnd, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_LABELTIP);
+	SetProp(hGridWnd, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hGridWnd, GWLP_WNDPROC, (LONG_PTR)cbHotKey));	
 
-	HWND hHeader = ListView_GetHeader(hDataWnd);
+	HWND hHeader = ListView_GetHeader(hGridWnd);
 	LONG_PTR styles = GetWindowLongPtr(hHeader, GWL_STYLE);
 	SetWindowLongPtr(hHeader, GWL_STYLE, styles | HDS_FILTERBAR);
+	SetWindowTheme(hHeader, TEXT(" "), TEXT(" "));
+	SetProp(hHeader, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hHeader, GWLP_WNDPROC, (LONG_PTR)cbNewHeader));
 
 	HMENU hDataMenu = CreatePopupMenu();
 	AppendMenu(hDataMenu, MF_STRING, IDM_COPY_CELL, TEXT("Copy cell"));
 	AppendMenu(hDataMenu, MF_STRING, IDM_COPY_ROW, TEXT("Copy row"));
+	AppendMenu(hDataMenu, MF_STRING, 0, NULL);	
+	AppendMenu(hDataMenu, (*(int*)GetProp(hMainWnd, TEXT("FILTERROW")) != 0 ? MF_CHECKED : 0) | MF_STRING, IDM_FILTER_ROW, TEXT("Filters"));		
+	if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) 
+		AppendMenu(hDataMenu, (*(int*)GetProp(hMainWnd, TEXT("HEADERROW")) != 0 ? MF_CHECKED : 0) | MF_STRING, IDM_HEADER_ROW, TEXT("Header row"));	
+	AppendMenu(hDataMenu, (*(int*)GetProp(hMainWnd, TEXT("DARKTHEME")) != 0 ? MF_CHECKED : 0) | MF_STRING, IDM_DARK_THEME, TEXT("Dark theme"));			
 	SetProp(hMainWnd, TEXT("DATAMENU"), hDataMenu);
 
 	int tCount = 0, vCount = 0;
@@ -236,7 +340,11 @@ HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
 		SQLGetData(hStmt, 4, SQL_WCHAR, tblType, MAX_DATA_LENGTH * sizeof(TCHAR), &res);
 		_tcslwr(tblType);
 
-		if (odbcType == ODBC_ACCESS && _tcscmp(tblType, TEXT("system table")) == 0)
+		BOOL isSystem = _tcscmp(tblType, TEXT("system table")) == 0;		
+		if (odbcType == ODBC_ACCESS && isSystem)
+			continue;
+
+		if ((odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) && !isSystem)
 			continue;
 
 		int pos = ListBox_AddString(hListWnd, tblName);
@@ -250,24 +358,38 @@ HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
 	SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
 
 	TCHAR buf[255];
+	_sntprintf(buf, 32, TEXT(" %ls"), APP_VERSION);	
+	SendMessage(hStatusWnd, SB_SETTEXT, SB_VERSION, (LPARAM)buf);
 	_sntprintf(buf, 255, TEXT(" Tables: %i"), tCount);
 	SendMessage(hStatusWnd, SB_SETTEXT, SB_TABLE_COUNT, (LPARAM)buf);
 	_sntprintf(buf, 255, TEXT(" Views: %i"), vCount);
 	SendMessage(hStatusWnd, SB_SETTEXT, SB_VIEW_COUNT, (LPARAM)buf);
 	
 	SendMessage(hMainWnd, WMU_SET_FONT, 0, 0);
-	SendMessage(hMainWnd, WM_SIZE, 0, 0);
-	
-	ListBox_SetCurSel(hListWnd, _tcscmp(fileext, TEXT(".csv")) == 0 ? ListBox_FindStringExact(hListWnd, -1, filepath + dlen) : 0);
+	SendMessage(hMainWnd, WMU_SET_THEME, 0, 0);	
+	ListBox_SetCurSel(hListWnd, 0);
 	SendMessage(hMainWnd, WMU_UPDATE_GRID, 0, 0);
+	ShowWindow(hMainWnd, SW_SHOW);
 	SetFocus(hListWnd);	
 
 	return hMainWnd;
 }
 
+HWND APIENTRY ListLoad (HWND hListerWnd, char* fileToLoad, int showFlags) {
+	DWORD size = MultiByteToWideChar(CP_ACP, 0, fileToLoad, -1, NULL, 0);
+	TCHAR* fileToLoadW = (TCHAR*)calloc (size, sizeof (TCHAR));
+	MultiByteToWideChar(CP_ACP, 0, fileToLoad, -1, fileToLoadW, size);
+	HWND hWnd = ListLoadW(hListerWnd, fileToLoadW, showFlags);
+	free(fileToLoadW);
+	return hWnd;
+}
+
 void __stdcall ListCloseWindow(HWND hWnd) {
 	setStoredValue(TEXT("splitter-position"), *(int*)GetProp(hWnd, TEXT("SPLITTERPOSITION")));
 	setStoredValue(TEXT("font-size"), *(int*)GetProp(hWnd, TEXT("FONTSIZE")));
+	setStoredValue(TEXT("filter-row"), *(int*)GetProp(hWnd, TEXT("FILTERROW")));		
+	setStoredValue(TEXT("header-row"), *(int*)GetProp(hWnd, TEXT("HEADERROW")));	
+	setStoredValue(TEXT("dark-theme"), *(int*)GetProp(hWnd, TEXT("DARKTHEME")));
 	
 	SQLHANDLE hEnv = (SQLHANDLE)GetProp(hWnd, TEXT("DBENV"));
 	SQLHANDLE hConn = (SQLHANDLE)GetProp(hWnd, TEXT("DB"));
@@ -276,42 +398,68 @@ void __stdcall ListCloseWindow(HWND hWnd) {
 	SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
 
 	SendMessage(hWnd, WMU_RESET_CACHE, 0, 0);
+	free((int*)GetProp(hWnd, TEXT("FILTERROW")));
+	free((int*)GetProp(hWnd, TEXT("HEADERROW")));
+	free((int*)GetProp(hWnd, TEXT("DARKTHEME")));
 	free((int*)GetProp(hWnd, TEXT("ORDERBY")));
+	free((TCHAR*)GetProp(hWnd, TEXT("DBPATH")));	
 	free((TCHAR*)GetProp(hWnd, TEXT("TABLENAME")));
 	free((TCHAR*)GetProp(hWnd, TEXT("WHERE")));
 	free((int*)GetProp(hWnd, TEXT("ROWCOUNT")));
 	free((int*)GetProp(hWnd, TEXT("TOTALROWCOUNT")));
 	free((int*)GetProp(hWnd, TEXT("SPLITTERPOSITION")));
-	free((int*)GetProp(hWnd, TEXT("FONTSIZE")));	
+	free((int*)GetProp(hWnd, TEXT("FONTSIZE")));
+	free((int*)GetProp(hWnd, TEXT("FILTERCOLOR")));		
 	free((int*)GetProp(hWnd, TEXT("COLNO")));
 	free((int*)GetProp(hWnd, TEXT("ODBCTYPE")));
 	free((TCHAR*)GetProp(hWnd, TEXT("FONTFAMILY")));
+	free((int*)GetProp(hWnd, TEXT("FILTERALIGN")));
+		
+	free((int*)GetProp(hWnd, TEXT("TEXTCOLOR")));
+	free((int*)GetProp(hWnd, TEXT("BACKCOLOR")));
+	free((int*)GetProp(hWnd, TEXT("FILTERTEXTCOLOR")));
+	free((int*)GetProp(hWnd, TEXT("FILTERBACKCOLOR")));	
+	free((int*)GetProp(hWnd, TEXT("SPLITTERCOLOR")));	
 
 	DeleteFont(GetProp(hWnd, TEXT("FONT")));
-	DeleteObject(GetProp(hWnd, TEXT("GRAYBRUSH")));
+	DeleteObject(GetProp(hWnd, TEXT("BACKBRUSH")));	
+	DeleteObject(GetProp(hWnd, TEXT("FILTERBACKBRUSH")));
+	DeleteObject(GetProp(hWnd, TEXT("SPLITTERBRUSH")));
 	DestroyMenu(GetProp(hWnd, TEXT("DATAMENU")));
 
 	RemoveProp(hWnd, TEXT("WNDPROC"));
+	RemoveProp(hWnd, TEXT("FILTERROW"));	
+	RemoveProp(hWnd, TEXT("HEADERROW"));	
+	RemoveProp(hWnd, TEXT("DARKTHEME"));	
 	RemoveProp(hWnd, TEXT("CACHE"));
 	RemoveProp(hWnd, TEXT("DBENV"));
 	RemoveProp(hWnd, TEXT("DB"));
 	RemoveProp(hWnd, TEXT("ORDERBY"));
-	RemoveProp(hWnd, TEXT("TABLENAME8"));
-	RemoveProp(hWnd, TEXT("WHERE8"));
+	RemoveProp(hWnd, TEXT("DBPATH"));	
+	RemoveProp(hWnd, TEXT("TABLENAME"));
+	RemoveProp(hWnd, TEXT("WHERE"));
 	RemoveProp(hWnd, TEXT("ROWCOUNT"));
 	RemoveProp(hWnd, TEXT("TOTALROWCOUNT"));
 	RemoveProp(hWnd, TEXT("SPLITTERPOSITION"));
 	RemoveProp(hWnd, TEXT("COLNO"));
+	RemoveProp(hWnd, TEXT("SEARCHCOLNO"));	
 	RemoveProp(hWnd, TEXT("ODBCTYPE"));
-
+	RemoveProp(hWnd, TEXT("FILTERALIGN"));
+	
 	RemoveProp(hWnd, TEXT("FONT"));
 	RemoveProp(hWnd, TEXT("FONTFAMILY"));
 	RemoveProp(hWnd, TEXT("FONTSIZE"));
-	RemoveProp(hWnd, TEXT("GRAYBRUSH"));
+	RemoveProp(hWnd, TEXT("TEXTCOLOR"));
+	RemoveProp(hWnd, TEXT("BACKCOLOR"));
+	RemoveProp(hWnd, TEXT("FILTERTEXTCOLOR"));
+	RemoveProp(hWnd, TEXT("FILTERBACKCOLOR"));
+	RemoveProp(hWnd, TEXT("SPLITTERCOLOR"));
+	RemoveProp(hWnd, TEXT("BACKBRUSH"));
+	RemoveProp(hWnd, TEXT("FILTERBACKBRUSH"));		
+	RemoveProp(hWnd, TEXT("SPLITTERBRUSH"));
 	RemoveProp(hWnd, TEXT("DATAMENU"));
 
 	DestroyWindow(hWnd);
-	return;
 }
 
 LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -326,9 +474,9 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			int splitterW = *(int*)GetProp(hWnd, TEXT("SPLITTERPOSITION"));
 			GetClientRect(hWnd, &rc);
 			HWND hListWnd = GetDlgItem(hWnd, IDC_TABLELIST);
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
 			SetWindowPos(hListWnd, 0, 0, 0, splitterW, rc.bottom - statusH, SWP_NOMOVE | SWP_NOZORDER);
-			SetWindowPos(hDataWnd, 0, splitterW + SPLITTER_WIDTH, 0, rc.right - splitterW - SPLITTER_WIDTH, rc.bottom - statusH, SWP_NOZORDER);
+			SetWindowPos(hGridWnd, 0, splitterW + SPLITTER_WIDTH, 0, rc.right - splitterW - SPLITTER_WIDTH, rc.bottom - statusH, SWP_NOZORDER);
 		}
 		break;
 
@@ -340,7 +488,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			GetClientRect(hWnd, &rc);
 			rc.left = *(int*)GetProp(hWnd, TEXT("SPLITTERPOSITION"));
 			rc.right = rc.left + SPLITTER_WIDTH;
-			FillRect(hDC, &rc, (HBRUSH)GetProp(hWnd, TEXT("GRAYBRUSH")));
+			FillRect(hDC, &rc, (HBRUSH)GetProp(hWnd, TEXT("SPLITTERBRUSH")));
 			EndPaint(hWnd, &ps);
 
 			return 0;
@@ -352,11 +500,17 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			return 1;
 		}
 		break;
+		
+		case WM_SETCURSOR: {
+			SetCursor(LoadCursor(0, GetProp(hWnd, TEXT("ISMOUSEHOVER")) ? IDC_SIZEWE : IDC_ARROW));
+			return TRUE;
+		}
+		break;		
 
 		case WM_LBUTTONDOWN: {
 			int x = GET_X_LPARAM(lParam);
 			int pos = *(int*)GetProp(hWnd, TEXT("SPLITTERPOSITION"));
-			if (x >= pos || x <= pos + SPLITTER_WIDTH) {
+			if (x >= pos && x <= pos + SPLITTER_WIDTH) {
 				SetProp(hWnd, TEXT("ISMOUSEDOWN"), (HANDLE)1);
 				SetCapture(hWnd);
 			}
@@ -369,15 +523,26 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			RemoveProp(hWnd, TEXT("ISMOUSEDOWN"));
 		}
 		break;
-
+		
 		case WM_MOUSEMOVE: {
-			if (wParam != MK_LBUTTON || !GetProp(hWnd, TEXT("ISMOUSEDOWN")))
-				return 0;
-
 			DWORD x = GET_X_LPARAM(lParam);
-			if (x > 0 && x < 32000)
-				*(int*)GetProp(hWnd, TEXT("SPLITTERPOSITION")) = x;
-			SendMessage(hWnd, WM_SIZE, 0, 0);
+			int* pPos = (int*)GetProp(hWnd, TEXT("SPLITTERPOSITION"));
+			
+			if (!GetProp(hWnd, TEXT("ISMOUSEHOVER")) && *pPos <= x && x <= *pPos + SPLITTER_WIDTH) {
+				TRACKMOUSEEVENT tme = {sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0};
+				TrackMouseEvent(&tme);	
+				SetProp(hWnd, TEXT("ISMOUSEHOVER"), (HANDLE)1);
+			}
+			
+			if (GetProp(hWnd, TEXT("ISMOUSEDOWN")) && x > 0 && x < 32000) {
+				*pPos = x;
+				SendMessage(hWnd, WM_SIZE, 0, 0);
+			}
+		}
+		break;
+		
+		case WM_MOUSELEAVE: {
+			SetProp(hWnd, TEXT("ISMOUSEHOVER"), 0);
 		}
 		break;
 		
@@ -409,7 +574,20 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				BOOL isBackward = HIWORD(GetKeyState(VK_CONTROL));
 				no += isBackward ? -1 : 1;
 				SetFocus(wnds[no] && no >= 0 ? wnds[no] : (isBackward ? wnds[cnt - 1] : wnds[0]));
+				return TRUE;
 			}
+			
+			if (wParam == VK_F1) {
+				ShellExecute(0, 0, TEXT("https://github.com/little-brother/odbc-wlx/wiki"), 0, 0 , SW_SHOW);
+				return TRUE;
+			}
+		}
+		break;
+		
+		case WM_CTLCOLORLISTBOX: {
+			SetBkColor((HDC)wParam, *(int*)GetProp(hWnd, TEXT("BACKCOLOR")));
+			SetTextColor((HDC)wParam, *(int*)GetProp(hWnd, TEXT("TEXTCOLOR")));
+			return (INT_PTR)(HBRUSH)GetProp(hWnd, TEXT("BACKBRUSH"));	
 		}
 		break;
 				
@@ -419,9 +597,9 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				SendMessage(hWnd, WMU_UPDATE_GRID, 0, 0);
 
 			if (cmd == IDM_COPY_CELL || cmd == IDM_COPY_ROW) {
-				HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
-				HWND hHeader = ListView_GetHeader(hDataWnd);
-				int rowNo = ListView_GetNextItem(hDataWnd, -1, LVNI_SELECTED);
+				HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+				HWND hHeader = ListView_GetHeader(hGridWnd);
+				int rowNo = ListView_GetNextItem(hGridWnd, -1, LVNI_SELECTED);
 				if (rowNo != -1) {
 					TCHAR*** cache = (TCHAR***)GetProp(hWnd, TEXT("CACHE"));
 
@@ -447,12 +625,22 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					setClipboardText(buf);
 				}
 			}
+			
+			if (cmd == IDM_FILTER_ROW || cmd == IDM_HEADER_ROW || cmd == IDM_DARK_THEME) {
+				HMENU hMenu = (HMENU)GetProp(hWnd, TEXT("GRIDMENU"));
+				int* pOpt = (int*)GetProp(hWnd, cmd == IDM_FILTER_ROW ? TEXT("FILTERROW") : cmd == IDM_HEADER_ROW ? TEXT("HEADERROW") : TEXT("DARKTHEME"));
+				*pOpt = (*pOpt + 1) % 2;
+				Menu_SetItemState(hMenu, cmd, *pOpt ? MFS_CHECKED : 0);
+				
+				UINT msg = cmd == IDM_FILTER_ROW ? WMU_SET_HEADER_FILTERS : cmd == IDM_HEADER_ROW ? WMU_UPDATE_GRID : WMU_SET_THEME;
+				SendMessage(hWnd, msg, 0, 0);				
+			}			
 		}
 		break;
 
 		case WM_NOTIFY : {
 			NMHDR* pHdr = (LPNMHDR)lParam;
-			if (pHdr->idFrom == IDC_DATAGRID && pHdr->code == LVN_GETDISPINFO) {
+			if (pHdr->idFrom == IDC_GRID && pHdr->code == LVN_GETDISPINFO) {
 				LV_DISPINFO* pDispInfo = (LV_DISPINFO*)lParam;
 				LV_ITEM* pItem= &(pDispInfo)->item;
 				TCHAR*** cache = (TCHAR***)GetProp(hWnd, TEXT("CACHE"));
@@ -461,7 +649,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					pItem->pszText = cache[pItem->iItem][pItem->iSubItem];
 			}
 
-			if (pHdr->idFrom == IDC_DATAGRID && pHdr->code == LVN_COLUMNCLICK) {
+			if (pHdr->idFrom == IDC_GRID && pHdr->code == LVN_COLUMNCLICK) {
 				NMLISTVIEW* pLV = (NMLISTVIEW*)lParam;
 				int colNo = pLV->iSubItem + 1;
 				int* pOrderBy = (int*)GetProp(hWnd, TEXT("ORDERBY"));
@@ -470,7 +658,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				SendMessage(hWnd, WMU_UPDATE_CACHE, 0, 0);
 			}
 
-			if (pHdr->idFrom == IDC_DATAGRID && pHdr->code == (DWORD)NM_RCLICK) {
+			if (pHdr->idFrom == IDC_GRID && pHdr->code == (DWORD)NM_RCLICK) {
 				NMITEMACTIVATE* ia = (LPNMITEMACTIVATE) lParam;
 
 				POINT p;
@@ -479,7 +667,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				TrackPopupMenu(GetProp(hWnd, TEXT("DATAMENU")), TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN, p.x, p.y, 0, hWnd, NULL);
 			}
 
-			if (pHdr->idFrom == IDC_DATAGRID && pHdr->code == (DWORD)LVN_ITEMCHANGED) {
+			if (pHdr->idFrom == IDC_GRID && pHdr->code == (DWORD)LVN_ITEMCHANGED) {
 				HWND hStatusWnd = GetDlgItem(hWnd, IDC_STATUSBAR);
 
 				TCHAR buf[255] = {0};
@@ -487,52 +675,64 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				if (pos != -1)
 					_sntprintf(buf, 255, TEXT(" %i"), pos + 1);
 				SendMessage(hStatusWnd, SB_SETTEXT, SB_CURRENT_ROW, (LPARAM)buf);
+				SendMessage(hStatusWnd, SB_SETTEXT, SB_AUXILIARY, (LPARAM)0);
 			}
 
-			if (pHdr->idFrom == IDC_DATAGRID && pHdr->code == (DWORD)LVN_KEYDOWN) {
+			if (pHdr->idFrom == IDC_GRID && pHdr->code == (DWORD)LVN_KEYDOWN) {
 				NMLVKEYDOWN* kd = (LPNMLVKEYDOWN) lParam;
 				if (kd->wVKey == 0x43 && GetKeyState(VK_CONTROL)) // Ctrl + C
 					SendMessage(hWnd, WM_COMMAND, IDM_COPY_ROW, 0);
 			}
 
-			if (pHdr->code == HDN_ITEMCHANGED && pHdr->hwndFrom == ListView_GetHeader(GetDlgItem(hWnd, IDC_DATAGRID)))
+			if (pHdr->code == HDN_ITEMCHANGED && pHdr->hwndFrom == ListView_GetHeader(GetDlgItem(hWnd, IDC_GRID)))
 				SendMessage(hWnd, WMU_UPDATE_FILTER_SIZE, 0, 0);
 		}
 		break;
 
 		case WMU_UPDATE_GRID: {
 			HWND hListWnd = GetDlgItem(hWnd, IDC_TABLELIST);
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
 			HWND hStatusWnd = GetDlgItem(hWnd, IDC_STATUSBAR);
 			SQLHANDLE hConn = (SQLHANDLE)GetProp(hWnd, TEXT("DB"));
-
-			SendMessage(hDataWnd, WM_SETREDRAW, FALSE, 0);
-			HWND hHeader = ListView_GetHeader(hDataWnd);
+			int odbcType = *(int*)GetProp(hWnd, TEXT("ODBCTYPE"));
+			BOOL isHeaderRow = *(int*)GetProp(hWnd, TEXT("HEADERROW"));
+			int filterAlign = *(int*)GetProp(hWnd, TEXT("FILTERALIGN"));
+			
+			SendMessage(hGridWnd, WM_SETREDRAW, FALSE, 0);
+			HWND hHeader = ListView_GetHeader(hGridWnd);
 
 			SendMessage(hWnd, WMU_RESET_CACHE, 0, 0);
-			ListView_SetItemCount(hDataWnd, 0);
+			ListView_SetItemCount(hGridWnd, 0);
 
 			int colCount = Header_GetItemCount(hHeader);
 			for (int colNo = 0; colNo < colCount; colNo++) 
 				DestroyWindow(GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo));
 
 			for (int colNo = 0; colNo < colCount; colNo++)
-				ListView_DeleteColumn(hDataWnd, colCount - colNo - 1);
+				ListView_DeleteColumn(hGridWnd, colCount - colNo - 1);
 
-			TCHAR* tablename = (TCHAR*)GetProp(hWnd, TEXT("TABLENAME"));
+			TCHAR* tablename = (TCHAR*)GetProp(hWnd, TEXT("TABLENAME"));			
 			int pos = ListBox_GetCurSel(hListWnd);
 			ListBox_GetText(hListWnd, pos, tablename);
 
 			TCHAR buf[255];
 			int type = SendMessage(hListWnd, LB_GETITEMDATA, pos, 0);
-			_sntprintf(buf, 255, type ? TEXT("  TABLE"): TEXT("   VIEW"));
+			_sntprintf(buf, 255, type ? TEXT(" TABLE"): TEXT("  VIEW"));
 			SendMessage(hStatusWnd, SB_SETTEXT, SB_TYPE, (LPARAM)buf);
 			SendMessage(hStatusWnd, SB_SETTEXT, SB_CURRENT_ROW, (LPARAM)0);
 
 			SQLHANDLE hStmt = 0;
 			SQLAllocHandle(SQL_HANDLE_STMT, hConn, &hStmt);
-			TCHAR query[1024 + _tcslen(tablename)];
-			_sntprintf(query, 1024 + _tcslen(tablename), TEXT("select * from \"%ls\" where 1 = 2"), tablename);
+			int len = 1024 + MAX_PATH + _tcslen(tablename);
+			TCHAR query[len + 1];
+			if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
+				TCHAR* dbpath = (TCHAR*)GetProp(hWnd, TEXT("DBPATH"));
+				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls\" where 1 = 2"), 
+					isHeaderRow ? TEXT("YES") : TEXT("NO"), dbpath, tablename);
+			} else { 
+				_sntprintf(query, len, TEXT("select * from \"%ls\" where 1 = 2"), tablename);
+			}
+			
 			if (SQL_SUCCESS == SQLExecDirect(hStmt, query, SQL_NTS)) {
 				SQLSMALLINT colCount = 0;
 				SQLNumResultCols(hStmt, &colCount);
@@ -541,42 +741,52 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					SQLWCHAR colName[MAX_COLUMN_LENGTH];
 					SQLSMALLINT colType = 0;
 					SQLDescribeCol(hStmt, colNo + 1, colName, MAX_COLUMN_LENGTH, 0, &colType, 0, 0, 0);
+					if (!isHeaderRow && (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX))
+						_sntprintf(colName, 64, TEXT("Column #%i"), colNo + 1);
 
 					int fmt = colType == SQL_DECIMAL || colType == SQL_NUMERIC || colType == SQL_REAL || colType == SQL_FLOAT || colType == SQL_DOUBLE ||
 						colType == SQL_SMALLINT || colType == SQL_INTEGER || colType == SQL_BIT || colType == SQL_TINYINT || colType == SQL_BIGINT ?
 						LVCFMT_RIGHT :
 						LVCFMT_LEFT;
 						
-					ListView_AddColumn(hDataWnd, colName, fmt);	
+					ListView_AddColumn(hGridWnd, colName, fmt);	
 				}
 
+				int align = filterAlign == -1 ? ES_LEFT : filterAlign == 1 ? ES_RIGHT : ES_CENTER;
 				for (int colNo = 0; colNo < colCount; colNo++) {
 					RECT rc;
 					Header_GetItemRect(hHeader, colNo, &rc);
-					HWND hEdit = CreateWindowEx(WS_EX_TOPMOST, WC_EDIT, NULL, ES_CENTER | ES_AUTOHSCROLL | WS_VISIBLE | WS_CHILD | WS_BORDER | WS_TABSTOP, 0, 0, 0, 0, hHeader, (HMENU)(INT_PTR)(IDC_HEADER_EDIT + colNo), GetModuleHandle(0), NULL);
+					HWND hEdit = CreateWindowEx(WS_EX_TOPMOST, WC_EDIT, NULL, align | ES_AUTOHSCROLL | WS_CHILD | WS_BORDER | WS_TABSTOP, 0, 0, 0, 0, hHeader, (HMENU)(INT_PTR)(IDC_HEADER_EDIT + colNo), GetModuleHandle(0), NULL);
 					SendMessage(hEdit, WM_SETFONT, (LPARAM)GetProp(hWnd, TEXT("FONT")), TRUE);
 					SetProp(hEdit, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hEdit, GWLP_WNDPROC, (LONG_PTR)cbNewFilterEdit));
 				}
 			} else {
-				SendMessage(hWnd, WMU_ERROR_MESSAGE, (WPARAM)hStmt, 0);
+				SQLWCHAR err[MAX_ERROR_LENGTH + 1];
+				SQLWCHAR code[6];
+				SQLGetDiagRec(SQL_HANDLE_STMT, hStmt, 1, code, NULL, err, MAX_ERROR_LENGTH, NULL);
+				TCHAR msg[MAX_ERROR_LENGTH + 100];
+				_sntprintf(msg, MAX_ERROR_LENGTH + 100, TEXT("Error (%ls): %ls"), code, err);
+				MessageBox(hWnd, msg, NULL, MB_OK);
 			}
 			SQLCloseCursor(hStmt);
 			SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
 
 			*(int*)GetProp(hWnd, TEXT("ORDERBY")) = 0;
 			SendMessage(hWnd, WMU_UPDATE_CACHE, 0, 0);
-			SendMessage(hDataWnd, WM_SETREDRAW, TRUE, 0);
+			SendMessage(hGridWnd, WM_SETREDRAW, TRUE, 0);
 
+			SendMessage(hWnd, WMU_SET_HEADER_FILTERS, 0, 0);
 			PostMessage(hWnd, WMU_AUTO_COLUMN_SIZE, 0, 0);
 		}
 		break;
 
 		case WMU_UPDATE_CACHE: {
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
 			HWND hStatusWnd = GetDlgItem(hWnd, IDC_STATUSBAR);
-			HWND hHeader = ListView_GetHeader(hDataWnd);
+			HWND hHeader = ListView_GetHeader(hGridWnd);
 			int colCount = Header_GetItemCount(hHeader);
 			SQLHANDLE hConn = (SQLHANDLE)GetProp(hWnd, TEXT("DB"));
+			int odbcType = *(int*)GetProp(hWnd, TEXT("ODBCTYPE"));
 			TCHAR* tablename = (TCHAR*)GetProp(hWnd, TEXT("TABLENAME"));
 			TCHAR* where = (TCHAR*)GetProp(hWnd, TEXT("WHERE"));
 			int* pRowCount = (int*)GetProp(hWnd, TEXT("ROWCOUNT"));
@@ -584,8 +794,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			int orderBy = *(int*)GetProp(hWnd, TEXT("ORDERBY"));
 
 			SendMessage(hWnd, WMU_RESET_CACHE, 0, 0);
-			ListView_SetItemCount(hDataWnd, 0);
-			SendMessage(hWnd, WMU_ERROR_MESSAGE, 0, 0);
+			ListView_SetItemCount(hGridWnd, 0);
 
 			_sntprintf(where, MAX_TEXT_LENGTH, TEXT("where (1 = 1)"));
 			for (int colNo = 0; colNo < colCount; colNo++) {
@@ -628,86 +837,84 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				}
 			}
 
-			int rowCount = -1;
-
+			int cacheSize = 1000;
+			TCHAR*** cache = calloc(cacheSize, sizeof(TCHAR*));
+			int rowLimit = getStoredValue(TEXT("max-row-count"), 0);
+			
 			SQLHANDLE hStmt = 0;
 			SQLAllocHandle(SQL_HANDLE_STMT, hConn, &hStmt);
-			int len = 1024 + _tcslen(tablename) + _tcslen(where);
+			int len = 1024 + MAX_PATH + _tcslen(tablename) + _tcslen(where);
 			TCHAR* query = calloc(len + 1, sizeof(TCHAR));
-			_sntprintf(query, len, TEXT("select count(*) from \"%ls\" %ls"), tablename, where);
-			if((SQL_SUCCESS == SQLExecDirect(hStmt, query, SQL_NTS)) && (SQL_SUCCESS == SQLFetch(hStmt))) {
-				SQLLEN res = 0;
-				SQLGetData(hStmt, 1, SQL_C_LONG, &rowCount, sizeof(int), &res);
-			}
-			free(query);
-
-			if (rowCount == -1) {
-				SendMessage(hWnd, WMU_ERROR_MESSAGE, (WPARAM)hStmt, 0);
-				SendMessage(hStatusWnd, SB_SETTEXT, SB_ROW_COUNT, (LPARAM)TEXT("N/A"));
-			}
-			SQLCloseCursor(hStmt);
-			SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-
-			int rowLimit = getStoredValue(TEXT("max-row-count"), 0);
-			if (rowLimit > 0 && rowCount > rowLimit && rowCount != -1) 
-				rowCount = rowLimit;
-
-			if (_tcscmp(where, TEXT("where (1 = 1)")) == 0)
-				*pTotalRowCount = rowCount;
-			*pRowCount = rowCount;
-
-			if (rowCount == -1)
-				return 0;
-
-			TCHAR buf[1024];
-			_sntprintf(buf, 255, TEXT(" Rows: %i/%i"), rowCount, *pTotalRowCount);
-			SendMessage(hStatusWnd, SB_SETTEXT, SB_ROW_COUNT, (LPARAM)buf);
-
-			ListView_SetItemCount(hDataWnd, rowCount);
-
-			if (rowCount == 0)
-				return 0;
-
-			SetProp(hWnd, TEXT("CACHE"), calloc(rowCount, sizeof(TCHAR*)));
-			TCHAR*** cache = (TCHAR***)GetProp(hWnd, TEXT("CACHE"));
-
-			SQLAllocHandle(SQL_HANDLE_STMT, hConn, &hStmt);
-			len = 1024 + _tcslen(tablename) + _tcslen(where);
-			query = calloc(len + 1, sizeof(TCHAR));
+			
 			TCHAR orderBy16[32] = {0};
 			if (orderBy > 0)
 				_sntprintf(orderBy16, 32, TEXT("order by %i"), orderBy);
 			if (orderBy < 0)
 				_sntprintf(orderBy16, 32, TEXT("order by %i desc"), -orderBy);
-			_sntprintf(query, len, TEXT("select * from \"%ls\" %ls %ls"), tablename, where, orderBy16);
 			
-			int rowNo = 0;
+			if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
+				TCHAR* dbpath = (TCHAR*)GetProp(hWnd, TEXT("DBPATH"));
+				BOOL isHeaderRow = *(int*)GetProp(hWnd, TEXT("HEADERROW"));
+				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls\" %ls %ls"), 
+					isHeaderRow ? TEXT("YES") : TEXT("NO"), dbpath, tablename, where, orderBy16);
+			} else { 
+				_sntprintf(query, len, TEXT("select * from \"%ls\" %ls %ls"), tablename, where, orderBy16);
+			}
+			
+			int rowNo = -1;
 			if(SQL_SUCCESS == SQLExecDirect(hStmt, query, SQL_NTS)) {
-				while (SQLFetch(hStmt) == SQL_SUCCESS && rowNo < rowCount) {						
+				rowNo = 0;
+				while (SQLFetch(hStmt) == SQL_SUCCESS && (rowNo < rowLimit || rowLimit == 0)) {
+					if (rowNo >= cacheSize) {
+						cacheSize += 100;
+						cache = realloc(cache, cacheSize * sizeof(TCHAR**));
+					}					
 					cache[rowNo] = (TCHAR**)calloc (colCount, sizeof (TCHAR*));
 
 					for (int colNo = 0; colNo < colCount; colNo++) {
 						SQLLEN res = 0;
 						SQLWCHAR val[MAX_DATA_LENGTH];
 						SQLGetData(hStmt, colNo + 1, SQL_C_TCHAR, val, MAX_DATA_LENGTH * sizeof(TCHAR), &res);
+							
 						cache[rowNo][colNo] = calloc(res + 2, sizeof(TCHAR)); // res = -1 for NULL
 						if (res > 0)
 							_tcsncpy(cache[rowNo][colNo], val, res);
 					}
-
+					
 					rowNo++;
 				}
+				
+				if (rowNo > 0)
+					cache = realloc(cache, rowNo * sizeof(TCHAR**));
 			}
 			SQLCloseCursor(hStmt);
 			SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-
-			free(query);
+			free(query);			
+			
+			if (rowNo > 0) {
+				SetProp(hWnd, TEXT("CACHE"), cache);
+			} else {
+				free(cache);
+			}
+			
+			if (_tcscmp(where, TEXT("where (1 = 1)")) == 0)
+				*pTotalRowCount = rowNo != -1 ? rowNo : 0;
+			*pRowCount = rowNo != -1 ? rowNo : 0;
+			ListView_SetItemCount(hGridWnd, *pRowCount);
+						
+			TCHAR buf[1024];
+			if (rowNo != -1)	
+				_sntprintf(buf, 255, TEXT(" Rows: %i/%i"), *pRowCount, *pTotalRowCount);
+			else 
+				_sntprintf(buf, 255, TEXT(" Rows: N/A"));
+			SendMessage(hStatusWnd, SB_SETTEXT, SB_ROW_COUNT, (LPARAM)buf);
+			SendMessage(hStatusWnd, SB_SETTEXT, SB_AUXILIARY, 0);			
 		}
 		break;
 
 		case WMU_UPDATE_FILTER_SIZE: {
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
-			HWND hHeader = ListView_GetHeader(hDataWnd);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+			HWND hHeader = ListView_GetHeader(hGridWnd);
 			int colCount = Header_GetItemCount(hHeader);
 			SendMessage(hHeader, WM_SIZE, 0, 0);
 			for (int colNo = 0; colNo < colCount; colNo++) {
@@ -718,31 +925,58 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 		}
 		break;
+		
+		case WMU_SET_HEADER_FILTERS: {
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+			HWND hHeader = ListView_GetHeader(hGridWnd);
+			int isFilterRow = *(int*)GetProp(hWnd, TEXT("FILTERROW"));
+			int colCount = Header_GetItemCount(hHeader);
+			
+			SendMessage(hWnd, WM_SETREDRAW, FALSE, 0);
+			LONG_PTR styles = GetWindowLongPtr(hHeader, GWL_STYLE);
+			styles = isFilterRow ? styles | HDS_FILTERBAR : styles & (~HDS_FILTERBAR);
+			SetWindowLongPtr(hHeader, GWL_STYLE, styles);
+					
+			for (int colNo = 0; colNo < colCount; colNo++) 		
+				ShowWindow(GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo), isFilterRow ? SW_SHOW : SW_HIDE);
+
+			if (isFilterRow)				
+				SendMessage(hWnd, WMU_UPDATE_FILTER_SIZE, 0, 0);											
+
+			// Bug fix: force Windows to redraw header
+			int w = ListView_GetColumnWidth(hGridWnd, 0);
+			ListView_SetColumnWidth(hGridWnd, 0, w + 1);
+			ListView_SetColumnWidth(hGridWnd, 0, w);			
+			SendMessage(hWnd, WM_SETREDRAW, TRUE, 0);
+			InvalidateRect(hWnd, NULL, TRUE);
+		}
+		break;
+		
 
 		case WMU_AUTO_COLUMN_SIZE: {
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
-			SendMessage(hDataWnd, WM_SETREDRAW, FALSE, 0);
-			HWND hHeader = ListView_GetHeader(hDataWnd);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+			SendMessage(hGridWnd, WM_SETREDRAW, FALSE, 0);
+			HWND hHeader = ListView_GetHeader(hGridWnd);
 			int colCount = Header_GetItemCount(hHeader);
 
 			for (int colNo = 0; colNo < colCount - 1; colNo++)
-				ListView_SetColumnWidth(hDataWnd, colNo, colNo < colCount - 1 ? LVSCW_AUTOSIZE_USEHEADER : LVSCW_AUTOSIZE);
+				ListView_SetColumnWidth(hGridWnd, colNo, colNo < colCount - 1 ? LVSCW_AUTOSIZE_USEHEADER : LVSCW_AUTOSIZE);
 
-			if (colCount == 1 && ListView_GetColumnWidth(hDataWnd, 0) < 100)
-				ListView_SetColumnWidth(hDataWnd, 0, 100);
+			if (colCount == 1 && ListView_GetColumnWidth(hGridWnd, 0) < 100)
+				ListView_SetColumnWidth(hGridWnd, 0, 100);
 				
 			int maxWidth = getStoredValue(TEXT("max-column-width"), 300);
 			if (colCount > 1) {
 				for (int colNo = 0; colNo < colCount; colNo++) {
-					if (ListView_GetColumnWidth(hDataWnd, colNo) > maxWidth)
-						ListView_SetColumnWidth(hDataWnd, colNo, maxWidth);
+					if (ListView_GetColumnWidth(hGridWnd, colNo) > maxWidth)
+						ListView_SetColumnWidth(hGridWnd, colNo, maxWidth);
 				}
 			}
 
 			// Fix last column				
 			if (colCount > 1) {
 				int colNo = colCount - 1;
-				ListView_SetColumnWidth(hDataWnd, colNo, LVSCW_AUTOSIZE);
+				ListView_SetColumnWidth(hGridWnd, colNo, LVSCW_AUTOSIZE);
 				TCHAR name16[MAX_COLUMN_LENGTH + 1];
 				Header_GetItemText(hHeader, colNo, name16, MAX_COLUMN_LENGTH);
 				
@@ -754,26 +988,26 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				ReleaseDC(hHeader, hDC);
 
 				int w = s.cx + 12;
-				if (ListView_GetColumnWidth(hDataWnd, colNo) < w)
-					ListView_SetColumnWidth(hDataWnd, colNo, w);
+				if (ListView_GetColumnWidth(hGridWnd, colNo) < w)
+					ListView_SetColumnWidth(hGridWnd, colNo, w);
 					
-				if (ListView_GetColumnWidth(hDataWnd, colNo) > maxWidth)
-					ListView_SetColumnWidth(hDataWnd, colNo, maxWidth);	
+				if (ListView_GetColumnWidth(hGridWnd, colNo) > maxWidth)
+					ListView_SetColumnWidth(hGridWnd, colNo, maxWidth);	
 			}
 
-			SendMessage(hDataWnd, WM_SETREDRAW, TRUE, 0);
-			InvalidateRect(hDataWnd, NULL, TRUE);
+			SendMessage(hGridWnd, WM_SETREDRAW, TRUE, 0);
+			InvalidateRect(hGridWnd, NULL, TRUE);
 
 			PostMessage(hWnd, WMU_UPDATE_FILTER_SIZE, 0, 0);
 		}
 		break;
 
 		case WMU_RESET_CACHE: {
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
 			TCHAR*** cache = (TCHAR***)GetProp(hWnd, TEXT("CACHE"));
 			int* pRowCount = (int*)GetProp(hWnd, TEXT("ROWCOUNT"));
 
-			int colCount = Header_GetItemCount(ListView_GetHeader(hDataWnd));
+			int colCount = Header_GetItemCount(ListView_GetHeader(hGridWnd));
 			if (colCount > 0 && cache != 0) {
 				for (int rowNo = 0; rowNo < *pRowCount; rowNo++) {
 					if (cache[rowNo]) {
@@ -803,37 +1037,75 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			HFONT hFont = CreateFont (*pFontSize, 0, 0, 0, FW_DONTCARE, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, (TCHAR*)GetProp(hWnd, TEXT("FONTFAMILY")));
 			HWND hListWnd = GetDlgItem(hWnd, IDC_TABLELIST);
-			HWND hDataWnd = GetDlgItem(hWnd, IDC_DATAGRID);
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
 			SendMessage(hListWnd, WM_SETFONT, (LPARAM)hFont, TRUE);
-			SendMessage(hDataWnd, WM_SETFONT, (LPARAM)hFont, TRUE);
+			SendMessage(hGridWnd, WM_SETFONT, (LPARAM)hFont, TRUE);
 
-			HWND hHeader = ListView_GetHeader(hDataWnd);
+			HWND hHeader = ListView_GetHeader(hGridWnd);
 			for (int colNo = 0; colNo < Header_GetItemCount(hHeader); colNo++)
 				SendMessage(GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo), WM_SETFONT, (LPARAM)hFont, TRUE);
+
+			int w = 0;
+			HDC hDC = GetDC(hListWnd);
+			HFONT hOldFont = (HFONT)SelectObject(hDC, hFont);
+			TCHAR buf[MAX_TABLE_LENGTH]; 
+			for (int i = 0; i < ListBox_GetCount(hListWnd); i++) {
+				SIZE s = {0};
+				ListBox_GetText(hListWnd, i, buf);
+				GetTextExtentPoint32(hDC, buf, _tcslen(buf), &s);			
+				if (w < s.cx)
+					w = s.cx;
+			}
+			SelectObject(hDC, hOldFont);
+			ReleaseDC(hHeader, hDC);
+			SendMessage(hListWnd, LB_SETHORIZONTALEXTENT, w, 0);
 
 			SetProp(hWnd, TEXT("FONT"), hFont);
 			PostMessage(hWnd, WMU_AUTO_COLUMN_SIZE, 0, 0);
 		}
-		break;		
+		break;	
+		
+		case WMU_SET_THEME: {
+			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+			BOOL isDark = *(int*)GetProp(hWnd, TEXT("DARKTHEME"));
+			
+			int textColor = !isDark ? getStoredValue(TEXT("text-color"), RGB(0, 0, 0)) : getStoredValue(TEXT("text-color-dark"), RGB(220, 220, 220));
+			int backColor = !isDark ? getStoredValue(TEXT("back-color"), RGB(255, 255, 255)) : getStoredValue(TEXT("back-color-dark"), RGB(32, 32, 32));
+			int filterTextColor = !isDark ? getStoredValue(TEXT("filter-text-color"), RGB(0, 0, 0)) : getStoredValue(TEXT("filter-text-color-dark"), RGB(255, 255, 255));
+			int filterBackColor = !isDark ? getStoredValue(TEXT("filter-back-color"), RGB(240, 240, 240)) : getStoredValue(TEXT("filter-back-color-dark"), RGB(60, 60, 60));
+			int splitterColor = !isDark ? getStoredValue(TEXT("splitter-color"), GetSysColor(COLOR_BTNFACE)) : getStoredValue(TEXT("splitter-color-dark"), GetSysColor(COLOR_BTNFACE));			
+			
+			*(int*)GetProp(hWnd, TEXT("TEXTCOLOR")) = textColor;
+			*(int*)GetProp(hWnd, TEXT("BACKCOLOR")) = backColor;
+			*(int*)GetProp(hWnd, TEXT("FILTERTEXTCOLOR")) = filterTextColor;
+			*(int*)GetProp(hWnd, TEXT("FILTERBACKCOLOR")) = filterBackColor;
+			*(int*)GetProp(hWnd, TEXT("SPLITTERCOLOR")) = splitterColor;
 
-		// wParam = hStmt
-		case WMU_ERROR_MESSAGE: {
-			HWND hStatusWnd = GetDlgItem(hWnd, IDC_STATUSBAR);
-			SQLHANDLE hStmt = (SQLHANDLE)wParam;
-			if (hStmt) {
-				SQLWCHAR err[MAX_ERROR_LENGTH + 1];
-				SQLWCHAR code[6];
-				SQLGetDiagRec(SQL_HANDLE_STMT, hStmt, 1, code, NULL, err, MAX_ERROR_LENGTH, NULL);
-				TCHAR msg[MAX_ERROR_LENGTH + 100];
-				_sntprintf(msg, MAX_ERROR_LENGTH + 100, TEXT("Error (%ls): %ls"), code, err);
+			DeleteObject(GetProp(hWnd, TEXT("BACKBRUSH")));			
+			DeleteObject(GetProp(hWnd, TEXT("FILTERBACKBRUSH")));			
+			DeleteObject(GetProp(hWnd, TEXT("SPLITTERBRUSH")));			
+			SetProp(hWnd, TEXT("BACKBRUSH"), CreateSolidBrush(backColor));
+			SetProp(hWnd, TEXT("FILTERBACKBRUSH"), CreateSolidBrush(filterBackColor));
+			SetProp(hWnd, TEXT("SPLITTERBRUSH"), CreateSolidBrush(splitterColor));			
 
-				SendMessage(hStatusWnd, SB_SETTEXT, SB_ERROR, (LPARAM)msg);
-			} else {
-				SendMessage(hStatusWnd, SB_SETTEXT, SB_ERROR, (LPARAM)TEXT(""));
-			}
+			ListView_SetTextColor(hGridWnd, textColor);			
+			ListView_SetBkColor(hGridWnd, backColor);
+			ListView_SetTextBkColor(hGridWnd, backColor);
+			InvalidateRect(hWnd, NULL, TRUE);	
 		}
 		break;
 	}
+	return CallWindowProc((WNDPROC)GetProp(hWnd, TEXT("WNDPROC")), hWnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK cbNewHeader(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	if (msg == WM_CTLCOLOREDIT) {
+		HWND hMainWnd = getMainWindow(hWnd);
+		SetBkColor((HDC)wParam, *(int*)GetProp(hMainWnd, TEXT("FILTERBACKCOLOR")));
+		SetTextColor((HDC)wParam, *(int*)GetProp(hMainWnd, TEXT("FILTERTEXTCOLOR")));
+		return (INT_PTR)(HBRUSH)GetProp(hMainWnd, TEXT("FILTERBACKBRUSH"));	
+	}
+	
 	return CallWindowProc((WNDPROC)GetProp(hWnd, TEXT("WNDPROC")), hWnd, msg, wParam, lParam);
 }
 
@@ -841,14 +1113,13 @@ LRESULT CALLBACK cbNewFilterEdit(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 	WNDPROC cbDefault = (WNDPROC)GetProp(hWnd, TEXT("WNDPROC"));
 
 	switch(msg){
-		// Win10+ fix: draw an upper border
 		case WM_PAINT: {
 			cbDefault(hWnd, msg, wParam, lParam);
 
 			RECT rc;
-			GetWindowRect(hWnd, &rc);
+			GetClientRect(hWnd, &rc);
 			HDC hDC = GetWindowDC(hWnd);
-			HPEN hPen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNFACE));
+			HPEN hPen = CreatePen(PS_SOLID, 1, *(int*)GetProp(getMainWindow(hWnd), TEXT("FILTERBACKCOLOR")));
 			HPEN oldPen = SelectObject(hDC, hPen);
 			MoveToEx(hDC, 1, 0, 0);
 			LineTo(hDC, rc.right - 1, 0);
@@ -867,11 +1138,7 @@ LRESULT CALLBACK cbNewFilterEdit(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 		case WM_KEYDOWN: {
 			if (wParam == VK_RETURN) {			
-				HWND hHeader = GetParent(hWnd);
-				HWND hDataWnd = GetParent(hHeader);
-				HWND hMainWnd = GetParent(hDataWnd);
-				SendMessage(hMainWnd, WMU_UPDATE_CACHE, 0, 0);
-				
+				SendMessage(getMainWindow(hWnd), WMU_UPDATE_CACHE, 0, 0);				
 				return 0;
 			}
 			
@@ -890,11 +1157,16 @@ LRESULT CALLBACK cbNewFilterEdit(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 LRESULT CALLBACK cbHotKey(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-	if (msg == WM_KEYDOWN && (wParam == VK_TAB || wParam == VK_ESCAPE)) {
-		HWND hMainWnd = hWnd;
-		while (hMainWnd && GetDlgCtrlID(hMainWnd) != IDC_MAIN)
-			hMainWnd = GetParent(hMainWnd);
-		SendMessage(hMainWnd, WM_KEYDOWN, wParam, lParam);
+	if (msg == WM_KEYDOWN && (
+		wParam == VK_TAB || wParam == VK_ESCAPE || 
+		wParam == VK_F3 || wParam == VK_F5 || wParam == VK_F7 || (HIWORD(GetKeyState(VK_CONTROL)) && wParam == 0x46) || // Ctrl + F
+		wParam == VK_F1 || wParam == VK_F11 ||
+		(wParam >= 0x31 && wParam <= 0x42) && !getStoredValue(TEXT("disable-num-keys"), 0) || // 1 - 8
+		(wParam == 0x4E || wParam == 0x50) && !getStoredValue(TEXT("disable-np-keys"), 0))) { // N, P
+		HWND hMainWnd = getMainWindow(hWnd);
+		if (wParam == VK_F7 || wParam == 0x46)
+			*(int*)GetProp(hMainWnd, TEXT("SEARCHCOLNO")) = 0;
+		SendMessage(wParam == VK_TAB || wParam == VK_ESCAPE || wParam == VK_F1 ? hMainWnd : GetParent(hMainWnd), WM_KEYDOWN, wParam, lParam);
 		return 0;
 	}
 	
@@ -903,6 +1175,13 @@ LRESULT CALLBACK cbHotKey(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		return 0;
 	
 	return CallWindowProc((WNDPROC)GetProp(hWnd, TEXT("WNDPROC")), hWnd, msg, wParam, lParam);
+}
+
+HWND getMainWindow(HWND hWnd) {
+	HWND hMainWnd = hWnd;
+	while (hMainWnd && GetDlgCtrlID(hMainWnd) != IDC_MAIN)
+		hMainWnd = GetParent(hMainWnd);
+	return hMainWnd;	
 }
 
 void setStoredValue(TCHAR* name, int value) {
@@ -959,6 +1238,44 @@ char* utf16to8(const TCHAR* in) {
 	return out;
 }
 
+int findString(TCHAR* text, TCHAR* word, BOOL isMatchCase, BOOL isWholeWords) {
+	if (!text || !word)
+		return -1;
+		
+	int res = -1;
+	int tlen = _tcslen(text);
+	int wlen = _tcslen(word);	
+	if (!tlen || !wlen)
+		return res;
+	
+	if (!isMatchCase) {
+		TCHAR* ltext = calloc(tlen + 1, sizeof(TCHAR));
+		_tcsncpy(ltext, text, tlen);
+		text = _tcslwr(ltext);
+
+		TCHAR* lword = calloc(wlen + 1, sizeof(TCHAR));
+		_tcsncpy(lword, word, wlen);
+		word = _tcslwr(lword);
+	}
+
+	if (isWholeWords) {
+		for (int pos = 0; (res  == -1) && (pos <= tlen - wlen); pos++) 
+			res = (pos == 0 || pos > 0 && !_istalnum(text[pos - 1])) && 
+				!_istalnum(text[pos + wlen]) && 
+				_tcsncmp(text + pos, word, wlen) == 0 ? pos : -1;
+	} else {
+		TCHAR* s = _tcsstr(text, word);
+		res = s != NULL ? s - text : -1;
+	}
+	
+	if (!isMatchCase) {
+		free(text);
+		free(word);
+	}
+
+	return res; 
+}	
+
 void setClipboardText(const TCHAR* text) {
 	int len = (_tcslen(text) + 1) * sizeof(TCHAR);
 	HGLOBAL hMem =  GlobalAlloc(GMEM_MOVEABLE, len);
@@ -1007,4 +1324,12 @@ int Header_GetItemText(HWND hWnd, int i, TCHAR* pszText, int cchTextMax) {
 
 	_tcsncpy(pszText, buf, cchTextMax);
 	return rc;
+}
+
+void Menu_SetItemState(HMENU hMenu, UINT wID, UINT fState) {
+	MENUITEMINFO mii = {0};
+	mii.cbSize = sizeof(MENUITEMINFO);
+	mii.fMask = MIIM_STATE;
+	mii.fState = fState;
+	SetMenuItemInfo(hMenu, wID, FALSE, &mii);
 }

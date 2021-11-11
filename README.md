@@ -1,4 +1,4 @@
-**odbc-wlx** is a [Total Commander](https://www.ghisler.com/) plugin to view Access (\*.mdb, \*.accdb), Excel (\*.xls, \*.xlsx, \*.xlsb), CSV (\*.csv) and Data Source (\*.dsn) files through ODBC interface.
+**odbc-wlx** is a [Total Commander](https://www.ghisler.com/) plugin to view Access (\*.mdb, \*.accdb), Excel (\*.xls, \*.xlsx, \*.xlsb) and Data Source (\*.dsn) files through ODBC interface.
 64-bit version requires [Microsoft Access Database Engine 2010 Redistributable](https://www.microsoft.com/en-us/download/details.aspx?id=13255) or [2016](https://www.microsoft.com/en-us/download/details.aspx?id=54920).
 
 |[**Download the latest version**](https://github.com/little-brother/odbc-wlx/releases/latest/download/odbc-wlx.zip)|
