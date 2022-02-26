@@ -62,7 +62,7 @@
 #define ODBC_EXCELX            3
 
 #define APP_NAME               TEXT("odbc-wlx")
-#define APP_VERSION            TEXT("0.9.5")
+#define APP_VERSION            TEXT("0.9.6")
 
 #define LCS_FINDFIRST          1
 #define LCS_MATCHCASE          2
@@ -90,6 +90,7 @@ int CALLBACK cbEnumTabStopChildren (HWND hWnd, LPARAM lParam);
 TCHAR* utf8to16(const char* in);
 char* utf16to8(const TCHAR* in);
 int findString(TCHAR* text, TCHAR* word, BOOL isMatchCase, BOOL isWholeWords);
+TCHAR* extractUrl(TCHAR* data);
 void setClipboardText(const TCHAR* text);
 BOOL isNumber(TCHAR* val);
 int ListView_AddColumn(HWND hListWnd, TCHAR* colName, int fmt);
@@ -315,7 +316,7 @@ HWND APIENTRY ListLoadW (HWND hListerWnd, TCHAR* fileToLoad, int showFlags) {
 	int sizes[7] = {35 * z, 110 * z, 180 * z, 225 * z, 420 * z, 500 * z, -1};
 	SendMessage(hStatusWnd, SB_SETPARTS, 7, (LPARAM)&sizes);
 	
-	HWND hListWnd = CreateWindow(TEXT("LISTBOX"), NULL, WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | WS_HSCROLL,
+	HWND hListWnd = CreateWindow(TEXT("LISTBOX"), NULL, WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | WS_HSCROLL | LBS_SORT,
 		0, 0, 100, 100, hMainWnd, (HMENU)IDC_TABLELIST, GetModuleHandle(0), NULL);
 	SetProp(hListWnd, TEXT("WNDPROC"), (HANDLE)SetWindowLongPtr(hListWnd, GWLP_WNDPROC, (LONG_PTR)cbHotKey));	
 
@@ -359,8 +360,18 @@ HWND APIENTRY ListLoadW (HWND hListerWnd, TCHAR* fileToLoad, int showFlags) {
 		if (odbcType == ODBC_ACCESS && isSystem)
 			continue;
 
-		if ((odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) && !isSystem)
-			continue;
+		if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
+			TCHAR* tail = _tcsstr(tblName, TEXT("$'"));	
+			int len = tail ? _tcslen(tail) : 0;
+			if (len > 2 || len < 2 && !isSystem)
+				continue;
+			
+			// Remove $-tail or quotes e.g. 'tblName$'
+			TCHAR tmpName[MAX_DATA_LENGTH] = {0};
+			for (int i = 0; i < _tcslen(tblName) && tblName[i] != TEXT('$'); i++)
+				tmpName[i] = tblName[i];	
+			_sntprintf(tblName, MAX_DATA_LENGTH, TEXT("%ls"), tmpName + (tmpName[0] == TEXT('\'')));	
+		}
 
 		int pos = ListBox_AddString(hListWnd, tblName);
 		BOOL isTable = _tcsstr(tblType, TEXT("view")) == 0;
@@ -651,16 +662,19 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				int len = 0;
 				if (cmd == IDM_COPY_CELL) 
 					len = _tcslen(cache[rowNo][colNo]);
-				
+								
 				if (cmd == IDM_COPY_ROWS) {
 					int rowNo = ListView_GetNextItem(hGridWnd, -1, LVNI_SELECTED);
 					while (rowNo != -1) {
-						for (int i = 0; i < colCount; i++)
-							len += _tcslen(cache[rowNo][i]) + 1 /* column delimiter: TAB */;
+						for (int colNo = 0; colNo < colCount; colNo++) {
+							if (ListView_GetColumnWidth(hGridWnd, colNo)) 
+								len += _tcslen(cache[rowNo][colNo]) + 1; /* column delimiter: TAB */
+						}
+													
 						len++; /* \n */		
 						rowNo = ListView_GetNextItem(hGridWnd, rowNo, LVNI_SELECTED);	
 					}
-				}
+				}				
 
 				if (cmd == IDM_COPY_COLUMN) {
 					int rowNo = selCount < 2 ? 0 : ListView_GetNextItem(hGridWnd, -1, LVNI_SELECTED);
@@ -673,21 +687,25 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				TCHAR* buf = calloc(len + 1, sizeof(TCHAR));
 				if (cmd == IDM_COPY_CELL)
 					_tcscat(buf, cache[rowNo][colNo]);
-				
+								
 				if (cmd == IDM_COPY_ROWS) {
 					int pos = 0;
 					int rowNo = ListView_GetNextItem(hGridWnd, -1, LVNI_SELECTED);
 					while (rowNo != -1) {
-						for (int i = 0; i < colCount; i++) {
-							int len = _tcslen(cache[rowNo][i]);
-							_tcsncpy(buf + pos, cache[rowNo][i], len);
-							buf[pos + len] = i == colCount - 1 ? TEXT('\n') : TEXT('\t');
-							pos += len + 1;
+						for (int colNo = 0; colNo < colCount; colNo++) {
+							if (ListView_GetColumnWidth(hGridWnd, colNo)) {
+								int len = _tcslen(cache[rowNo][colNo]);
+								_tcsncpy(buf + pos, cache[rowNo][colNo], len);
+								buf[pos + len] = TEXT('\t');
+								pos += len + 1;
+							}
 						}
+
+						buf[pos - (pos > 0)] = TEXT('\n');
 						rowNo = ListView_GetNextItem(hGridWnd, rowNo, LVNI_SELECTED);	
 					}
 					buf[pos - 1] = 0; // remove last \n
-				}
+				}				
 
 				if (cmd == IDM_COPY_COLUMN) {
 					int pos = 0;
@@ -730,18 +748,40 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 
 			if (pHdr->idFrom == IDC_GRID && pHdr->code == LVN_COLUMNCLICK) {
-				NMLISTVIEW* pLV = (NMLISTVIEW*)lParam;
-				int colNo = pLV->iSubItem + 1;
-				int* pOrderBy = (int*)GetProp(hWnd, TEXT("ORDERBY"));
-				int orderBy = *pOrderBy;
-				*pOrderBy = colNo == orderBy || colNo == -orderBy ? -orderBy : colNo;
-				SendMessage(hWnd, WMU_UPDATE_CACHE, 0, 0);
+				NMLISTVIEW* lv = (NMLISTVIEW*)lParam;
+				// Hide or sort the column
+				if (HIWORD(GetKeyState(VK_CONTROL))) {
+					HWND hGridWnd = pHdr->hwndFrom;
+					HWND hHeader = ListView_GetHeader(hGridWnd);
+					int colNo = lv->iSubItem;
+					
+					HWND hEdit = GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo);
+					SetWindowLongPtr(hEdit, GWLP_USERDATA, (LONG_PTR)ListView_GetColumnWidth(hGridWnd, colNo));				
+					ListView_SetColumnWidth(pHdr->hwndFrom, colNo, 0); 
+					InvalidateRect(hHeader, NULL, TRUE);
+				} else {
+					int colNo = lv->iSubItem + 1;
+					int* pOrderBy = (int*)GetProp(hWnd, TEXT("ORDERBY"));
+					int orderBy = *pOrderBy;
+					*pOrderBy = colNo == orderBy || colNo == -orderBy ? -orderBy : colNo;
+					SendMessage(hWnd, WMU_UPDATE_CACHE, 0, 0);				
+				}				
 			}
 
 			if (pHdr->idFrom == IDC_GRID && (pHdr->code == (DWORD)NM_CLICK || pHdr->code == (DWORD)NM_RCLICK)) {
 				NMITEMACTIVATE* ia = (LPNMITEMACTIVATE) lParam;
 				SendMessage(hWnd, WMU_SET_CURRENT_CELL, ia->iItem, ia->iSubItem);
 			}
+			
+			if (pHdr->idFrom == IDC_GRID && pHdr->code == (DWORD)NM_CLICK && HIWORD(GetKeyState(VK_MENU))) {	
+				NMITEMACTIVATE* ia = (LPNMITEMACTIVATE) lParam;
+				TCHAR*** cache = (TCHAR***)GetProp(hWnd, TEXT("CACHE"));
+				int* resultset = (int*)GetProp(hWnd, TEXT("RESULTSET"));
+				
+				TCHAR* url = extractUrl(cache[ia->iItem][ia->iSubItem]);
+				ShellExecute(0, TEXT("open"), url, 0, 0 , SW_SHOW);
+				free(url);
+			}			
 
 			if (pHdr->idFrom == IDC_GRID && pHdr->code == (DWORD)NM_RCLICK) {
 				POINT p;
@@ -781,6 +821,21 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					SendMessage(hGridWnd, WM_SETREDRAW, TRUE, 0);
 					InvalidateRect(hGridWnd, NULL, TRUE);
 				}
+				
+				if (kd->wVKey == 0x20 && HIWORD(GetKeyState(VK_CONTROL))) { // Ctrl + Space				
+					HWND hGridWnd = pHdr->hwndFrom;
+					HWND hHeader = ListView_GetHeader(hGridWnd);
+					int colCount = Header_GetItemCount(ListView_GetHeader(pHdr->hwndFrom));
+					for (int colNo = 0; colNo < colCount; colNo++) {
+						if (ListView_GetColumnWidth(hGridWnd, colNo) == 0) {
+							HWND hEdit = GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo);
+							ListView_SetColumnWidth(hGridWnd, colNo, (int)GetWindowLongPtr(hEdit, GWLP_USERDATA));
+						}
+					}
+
+					InvalidateRect(hGridWnd, NULL, TRUE);					
+					return TRUE;
+				}				
 				
 				if (kd->wVKey == VK_LEFT || kd->wVKey == VK_RIGHT) {
 					int colCount = Header_GetItemCount(ListView_GetHeader(pHdr->hwndFrom));
@@ -864,8 +919,17 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			TCHAR* tablename = (TCHAR*)GetProp(hWnd, TEXT("TABLENAME"));			
 			int pos = ListBox_GetCurSel(hListWnd);
-			ListBox_GetText(hListWnd, pos, tablename);
-
+			if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
+				TCHAR tmpName[MAX_TABLE_LENGTH] = {0};
+				ListBox_GetText(hListWnd, pos, tmpName);
+				BOOL q = FALSE;
+				for (int i = 0; i < _tcslen(tmpName) && !q; i++)
+					q = !_istalnum(tmpName[i]);
+				_sntprintf(tablename, MAX_TABLE_LENGTH, TEXT("%ls%ls$%ls"), q ? TEXT("'"): TEXT(""), tmpName, q ? TEXT("'"): TEXT(""));
+			} else {
+				ListBox_GetText(hListWnd, pos, tablename);
+			}
+			
 			TCHAR buf[255];
 			int type = SendMessage(hListWnd, LB_GETITEMDATA, pos, 0);
 			_sntprintf(buf, 255, type ? TEXT(" TABLE"): TEXT("  VIEW"));
@@ -1492,7 +1556,29 @@ int findString(TCHAR* text, TCHAR* word, BOOL isMatchCase, BOOL isWholeWords) {
 	}
 
 	return res; 
-}	
+}
+
+TCHAR* extractUrl(TCHAR* data) {
+	int len = data ? _tcslen(data) : 0;
+	int start = len;
+	int end = len;
+	
+	TCHAR* url = calloc(len + 10, sizeof(TCHAR));
+	
+	TCHAR* slashes = _tcsstr(data, TEXT("://"));
+	if (slashes) {
+		start = len - _tcslen(slashes);
+		end = start + 3;
+		for (; start > 0 && _istalpha(data[start - 1]); start--);
+		for (; end < len && data[end] != TEXT(' ') && data[end] != TEXT('"') && data[end] != TEXT('\''); end++);
+		_tcsncpy(url, data + start, end - start);
+		
+	} else if (_tcschr(data, TEXT('.'))) {
+		_sntprintf(url, len + 10, TEXT("https://%ls"), data);
+	}
+	
+	return url;
+}
 
 void setClipboardText(const TCHAR* text) {
 	int len = (_tcslen(text) + 1) * sizeof(TCHAR);
