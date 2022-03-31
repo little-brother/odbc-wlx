@@ -67,7 +67,7 @@
 #define ODBC_EXCELX            3
 
 #define APP_NAME               TEXT("odbc-wlx")
-#define APP_VERSION            TEXT("0.9.7")
+#define APP_VERSION            TEXT("0.9.8")
 
 #define LCS_FINDFIRST          1
 #define LCS_MATCHCASE          2
@@ -1162,6 +1162,8 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			LONG_PTR styles = GetWindowLongPtr(hHeader, GWL_STYLE);
 			styles = isFilterRow ? styles | HDS_FILTERBAR : styles & (~HDS_FILTERBAR);
 			SetWindowLongPtr(hHeader, GWL_STYLE, styles);
+
+	
 					
 			for (int colNo = 0; colNo < colCount; colNo++) 		
 				ShowWindow(GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo), isFilterRow ? SW_SHOW : SW_HIDE);
@@ -1170,9 +1172,12 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				SendMessage(hWnd, WMU_UPDATE_FILTER_SIZE, 0, 0);											
 
 			// Bug fix: force Windows to redraw header
-			int w = ListView_GetColumnWidth(hGridWnd, 0);
-			ListView_SetColumnWidth(hGridWnd, 0, w + 1);
-			ListView_SetColumnWidth(hGridWnd, 0, w);			
+			if (IsWindowVisible(hGridWnd)) { // Win10x64, TCx32 
+				int w = ListView_GetColumnWidth(hGridWnd, 0);
+				ListView_SetColumnWidth(hGridWnd, 0, w + 1);
+				ListView_SetColumnWidth(hGridWnd, 0, w);			
+			}
+
 			SendMessage(hWnd, WM_SETREDRAW, TRUE, 0);
 			InvalidateRect(hWnd, NULL, TRUE);
 		}
