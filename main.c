@@ -67,7 +67,7 @@
 #define ODBC_EXCELX            3
 
 #define APP_NAME               TEXT("odbc-wlx")
-#define APP_VERSION            TEXT("0.9.8")
+#define APP_VERSION            TEXT("0.9.9")
 
 #define LCS_FINDFIRST          1
 #define LCS_MATCHCASE          2
@@ -1018,7 +1018,9 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			int* pRowCount = (int*)GetProp(hWnd, TEXT("ROWCOUNT"));
 			int* pTotalRowCount = (int*)GetProp(hWnd, TEXT("TOTALROWCOUNT"));
 			int orderBy = *(int*)GetProp(hWnd, TEXT("ORDERBY"));
-
+			BOOL isHeaderRow = *(int*)GetProp(hWnd, TEXT("HEADERROW"));
+			BOOL isExcel = odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX;
+			
 			SendMessage(hWnd, WMU_RESET_CACHE, 0, 0);
 			ListView_SetItemCount(hGridWnd, 0);
 
@@ -1028,7 +1030,10 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				int len = GetWindowTextLength(hEdit);
 				if (len > 0) {
 					TCHAR colName[256] = {0};
-					Header_GetItemText(hHeader, colNo, colName, 255);
+					if (!isHeaderRow && isExcel)
+						_sntprintf(colName, 255, TEXT("F%i"), colNo + 1);
+					else	
+						Header_GetItemText(hHeader, colNo, colName, 255);
 
 					TCHAR val[len + 1];
 					GetWindowText(hEdit, val, len + 1);
@@ -1054,7 +1059,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					TCHAR cond[MAX_TEXT_LENGTH];
 					_sntprintf(cond, MAX_TEXT_LENGTH, len == 1 ? TEXT("\" like '%%' & %ls & '%%'") :
 						val[0] == TEXT('=') ? TEXT("\" = %ls") :
-						val[0] == TEXT('!') ? TEXT("\" not like '%%' & ? & '%%'") :
+						val[0] == TEXT('!') ? TEXT("\" not like '%%' & %ls & '%%'") :
 						val[0] == TEXT('>') ? TEXT("\" > %ls") :
 						val[0] == TEXT('<') ? TEXT("\" < %ls") :
 						TEXT("\" like '%%' & %ls & '%%'"), isNumber(val + hasPrefix) ? val + hasPrefix : qval);
@@ -1078,15 +1083,14 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			if (orderBy < 0)
 				_sntprintf(orderBy16, 32, TEXT("order by %i desc"), -orderBy);
 			
-			if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
+			if (isExcel) {
 				TCHAR* dbpath = (TCHAR*)GetProp(hWnd, TEXT("DBPATH"));
-				BOOL isHeaderRow = *(int*)GetProp(hWnd, TEXT("HEADERROW"));
 				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls\" %ls %ls"), 
 					isHeaderRow ? TEXT("YES") : TEXT("NO"), dbpath, tablename, where, orderBy16);
 			} else { 
 				_sntprintf(query, len, TEXT("select * from \"%ls\" %ls %ls"), tablename, where, orderBy16);
 			}
-			
+						
 			int rowNo = -1;
 			if(SQL_SUCCESS == SQLExecDirect(hStmt, query, SQL_NTS)) {
 				rowNo = 0;
@@ -1098,13 +1102,24 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					cache[rowNo] = (TCHAR**)calloc (colCount, sizeof (TCHAR*));
 
 					for (int colNo = 0; colNo < colCount; colNo++) {
-						SQLLEN res = 0;
+						SQLLEN bytes = 0;
 						SQLWCHAR val[MAX_DATA_LENGTH];
-						SQLGetData(hStmt, colNo + 1, SQL_C_TCHAR, val, MAX_DATA_LENGTH * sizeof(TCHAR), &res);
+						SQLGetData(hStmt, colNo + 1, SQL_C_TCHAR, val, MAX_DATA_LENGTH * sizeof(TCHAR), &bytes);
+						
+						int len = bytes == -1 /* NULL */ ? 0 : bytes / 2;
+						cache[rowNo][colNo] = calloc(len + 1, sizeof(TCHAR));
+						
+						if (len > 0) {
+							// Excel: fix trailing zero .0
+							if (isExcel && len > 2 && (val[len - 2] == TEXT('.')) && (val[len - 1] == TEXT('0'))) {
+								BOOL isNum = TRUE;
+								for (int i = 0; isNum && i < len - 2; i++)
+									isNum = _istdigit(val[i]);
+								len -= isNum ? 2 : 0;
+							}
 							
-						cache[rowNo][colNo] = calloc(res + 2, sizeof(TCHAR)); // res = -1 for NULL
-						if (res > 0)
-							_tcsncpy(cache[rowNo][colNo], val, res);
+							_tcsncpy(cache[rowNo][colNo], val, len);
+						}
 					}
 					
 					rowNo++;
