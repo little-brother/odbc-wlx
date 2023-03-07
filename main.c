@@ -67,7 +67,7 @@
 #define ODBC_EXCELX            3
 
 #define APP_NAME               TEXT("odbc-wlx")
-#define APP_VERSION            TEXT("1.0.2")
+#define APP_VERSION            TEXT("1.0.3")
 
 #define LCS_FINDFIRST          1
 #define LCS_MATCHCASE          2
@@ -1408,7 +1408,8 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			if (wParam == VK_ESCAPE || wParam == VK_F11 ||
 				wParam == VK_F3 || wParam == VK_F5 || wParam == VK_F7 || (isCtrl && wParam == 0x46) || // Ctrl + F
 				((wParam >= 0x31 && wParam <= 0x38) && !getStoredValue(TEXT("disable-num-keys"), 0) || // 1 - 8
-				(wParam == 0x4E || wParam == 0x50) && !getStoredValue(TEXT("disable-np-keys"), 0)) && // N, P
+				(wParam == 0x4E || wParam == 0x50) && !getStoredValue(TEXT("disable-np-keys"), 0) || // N, P
+				wParam == 0x51 && getStoredValue(TEXT("exit-by-q"), 0)) && // Q
 				GetDlgCtrlID(GetFocus()) / 100 * 100 != IDC_HEADER_EDIT) { 
 				SetFocus(GetParent(hWnd));		
 				keybd_event(wParam, wParam, KEYEVENTF_EXTENDEDKEY, 0);
@@ -1422,11 +1423,16 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		
 		case WMU_HOT_CHARS: {
 			BOOL isCtrl = HIWORD(GetKeyState(VK_CONTROL));
+
+			unsigned char scancode = ((unsigned char*)&lParam)[2];
+			UINT key = MapVirtualKey(scancode,MAPVK_VSC_TO_VK);
+
 			return !_istprint(wParam) && (
 				wParam == VK_ESCAPE || wParam == VK_F11 || wParam == VK_F1 ||
 				wParam == VK_F3 || wParam == VK_F5 || wParam == VK_F7) ||
 				wParam == VK_TAB || wParam == VK_RETURN ||
-				isCtrl && (wParam == 0x46 || wParam == 0x20);	
+				isCtrl && key == 0x46 || // Ctrl + F
+				getStoredValue(TEXT("exit-by-q"), 0) && key == 0x51 && GetDlgCtrlID(GetFocus()) / 100 * 100 != IDC_HEADER_EDIT; // Q	
 		}
 		break;				
 	}
