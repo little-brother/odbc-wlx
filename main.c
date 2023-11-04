@@ -67,7 +67,7 @@
 #define ODBC_EXCELX            3
 
 #define APP_NAME               TEXT("odbc-wlx")
-#define APP_VERSION            TEXT("1.0.4")
+#define APP_VERSION            TEXT("1.0.5")
 
 #define LCS_FINDFIRST          1
 #define LCS_MATCHCASE          2
@@ -933,16 +933,8 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			TCHAR* tablename = (TCHAR*)GetProp(hWnd, TEXT("TABLENAME"));			
 			int pos = ListBox_GetCurSel(hListWnd);
-			if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
-				TCHAR tmpName[MAX_TABLE_LENGTH] = {0};
-				ListBox_GetText(hListWnd, pos, tmpName);
-				BOOL q = FALSE;
-				for (int i = 0; i < _tcslen(tmpName) && !q; i++)
-					q = !_istalnum(tmpName[i]) && tmpName[i] != TEXT('_');
-				_sntprintf(tablename, MAX_TABLE_LENGTH, TEXT("%ls%ls$%ls"), q ? TEXT("'"): TEXT(""), tmpName, q ? TEXT("'"): TEXT(""));
-			} else {
-				ListBox_GetText(hListWnd, pos, tablename);
-			}
+			ListBox_GetText(hListWnd, pos, tablename);
+			
 			
 			TCHAR buf[255];
 			int type = SendMessage(hListWnd, LB_GETITEMDATA, pos, 0);
@@ -955,7 +947,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			TCHAR query[len + 1];
 			if (odbcType == ODBC_EXCEL || odbcType == ODBC_EXCELX) {
 				TCHAR* dbpath = (TCHAR*)GetProp(hWnd, TEXT("DBPATH"));
-				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls\" where 1 = 2"), 
+				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls$\" where 1 = 2"), 
 					isHeaderRow ? TEXT("YES") : TEXT("NO"), dbpath, tablename);
 			} else { 
 				_sntprintf(query, len, TEXT("select * from \"%ls\" where 1 = 2"), tablename);
@@ -1087,7 +1079,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			
 			if (isExcel) {
 				TCHAR* dbpath = (TCHAR*)GetProp(hWnd, TEXT("DBPATH"));
-				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls\" %ls %ls"), 
+				_sntprintf(query, len, TEXT("select * from \"Excel 8.0;HDR=%ls;IMEX=1;Database=%ls;\".\"%ls$\" %ls %ls"), 
 					isHeaderRow ? TEXT("YES") : TEXT("NO"), dbpath, tablename, where, orderBy16);
 			} else { 
 				_sntprintf(query, len, TEXT("select * from \"%ls\" %ls %ls"), tablename, where, orderBy16);
