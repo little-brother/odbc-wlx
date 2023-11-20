@@ -29,8 +29,10 @@
 #define WMU_SET_THEME          WM_USER + 9
 #define WMU_HIDE_COLUMN        WM_USER + 10
 #define WMU_SHOW_COLUMNS       WM_USER + 11
-#define WMU_HOT_KEYS           WM_USER + 12  
-#define WMU_HOT_CHARS          WM_USER + 13
+#define WMU_SORT_COLUMN        WM_USER + 12
+#define WMU_HOT_KEYS           WM_USER + 13  
+#define WMU_HOT_CHARS          WM_USER + 14
+
 
 #define IDC_MAIN               100
 #define IDC_TABLELIST          101
@@ -67,7 +69,7 @@
 #define ODBC_EXCELX            3
 
 #define APP_NAME               TEXT("odbc-wlx")
-#define APP_VERSION            TEXT("1.0.5")
+#define APP_VERSION            TEXT("1.0.6")
 
 #define LCS_FINDFIRST          1
 #define LCS_MATCHCASE          2
@@ -758,23 +760,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			if (pHdr->idFrom == IDC_GRID && pHdr->code == LVN_COLUMNCLICK) {
 				NMLISTVIEW* lv = (NMLISTVIEW*)lParam;
-				// Hide or sort the column
-				if (HIWORD(GetKeyState(VK_CONTROL))) {
-					HWND hGridWnd = pHdr->hwndFrom;
-					HWND hHeader = ListView_GetHeader(hGridWnd);
-					int colNo = lv->iSubItem;
-					
-					HWND hEdit = GetDlgItem(hHeader, IDC_HEADER_EDIT + colNo);
-					SetWindowLongPtr(hEdit, GWLP_USERDATA, (LONG_PTR)ListView_GetColumnWidth(hGridWnd, colNo));				
-					ListView_SetColumnWidth(pHdr->hwndFrom, colNo, 0); 
-					InvalidateRect(hHeader, NULL, TRUE);
-				} else {
-					int colNo = lv->iSubItem + 1;
-					int* pOrderBy = (int*)GetProp(hWnd, TEXT("ORDERBY"));
-					int orderBy = *pOrderBy;
-					*pOrderBy = colNo == orderBy || colNo == -orderBy ? -orderBy : colNo;
-					SendMessage(hWnd, WMU_UPDATE_CACHE, 0, 0);				
-				}				
+				return SendMessage(hWnd, HIWORD(GetKeyState(VK_CONTROL)) ? WMU_HIDE_COLUMN : WMU_SORT_COLUMN, lv->iSubItem, 0);
 			}
 
 			if (pHdr->idFrom == IDC_GRID && (pHdr->code == (DWORD)NM_CLICK || pHdr->code == (DWORD)NM_RCLICK)) {
@@ -837,9 +823,25 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				}				
 				
 				if (kd->wVKey == VK_LEFT || kd->wVKey == VK_RIGHT) {
+					HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+					HWND hHeader = ListView_GetHeader(hGridWnd);
+
 					int colCount = Header_GetItemCount(ListView_GetHeader(pHdr->hwndFrom));
-					int colNo = *(int*)GetProp(hWnd, TEXT("CURRENTCOLNO")) + (kd->wVKey == VK_RIGHT ? 1 : -1);
-					colNo = colNo < 0 ? colCount - 1 : colNo > colCount - 1 ? 0 : colNo;
+					int colNo = *(int*)GetProp(hWnd, TEXT("CURRENTCOLNO"));
+
+					int* colOrder = calloc(colCount, sizeof(int));
+					Header_GetOrderArray(hHeader, colCount, colOrder);
+	
+					int dir = kd->wVKey == VK_RIGHT ? 1 : -1;
+					int idx = 0;
+					for (idx; colOrder[idx] != colNo; idx++);
+					do {
+						idx = (colCount + idx + dir) % colCount;
+					} while (ListView_GetColumnWidth(hGridWnd, colOrder[idx]) == 0);
+
+					colNo = colOrder[idx];
+					free(colOrder);
+
 					SendMessage(hWnd, WMU_SET_CURRENT_CELL, *(int*)GetProp(hWnd, TEXT("CURRENTROWNO")), colNo);
 					return TRUE;
 				}
@@ -905,6 +907,19 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 
 			InvalidateRect(hGridWnd, NULL, TRUE);		
+		}
+		break;	
+
+		// wParam = colNo
+		case WMU_SORT_COLUMN: {
+			int colNo = (int)wParam + 1;
+			if (colNo <= 0)
+				return FALSE;
+
+			int* pOrderBy = (int*)GetProp(hWnd, TEXT("ORDERBY"));
+			int orderBy = *pOrderBy;
+			*pOrderBy = colNo == orderBy || colNo == -orderBy ? -orderBy : colNo;
+			SendMessage(hWnd, WMU_UPDATE_CACHE, 0, 0);				
 		}
 		break;			
 
@@ -1314,7 +1329,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			*pFontSize += wParam;
 			DeleteFont(GetProp(hWnd, TEXT("FONT")));
 
-			HFONT hFont = CreateFont (*pFontSize, 0, 0, 0, FW_DONTCARE, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, (TCHAR*)GetProp(hWnd, TEXT("FONTFAMILY")));
+			HFONT hFont = CreateFont (*pFontSize, 0, 0, 0, FW_DONTCARE, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, (TCHAR*)GetProp(hWnd, TEXT("FONTFAMILY")));
 			HWND hListWnd = GetDlgItem(hWnd, IDC_TABLELIST);
 			HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
 			SendMessage(hListWnd, WM_SETFONT, (LPARAM)hFont, TRUE);
@@ -1413,7 +1428,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			
 			if (wParam == VK_ESCAPE || wParam == VK_F11 ||
 				wParam == VK_F3 || wParam == VK_F5 || wParam == VK_F7 || (isCtrl && wParam == 0x46) || // Ctrl + F
-				((wParam >= 0x31 && wParam <= 0x38) && !getStoredValue(TEXT("disable-num-keys"), 0) || // 1 - 8
+				((wParam >= 0x31 && wParam <= 0x38) && !getStoredValue(TEXT("disable-num-keys"), 0) && !isCtrl || // 1 - 8
 				(wParam == 0x4E || wParam == 0x50) && !getStoredValue(TEXT("disable-np-keys"), 0) || // N, P
 				wParam == 0x51 && getStoredValue(TEXT("exit-by-q"), 0)) && // Q
 				GetDlgCtrlID(GetFocus()) / 100 * 100 != IDC_HEADER_EDIT) { 
@@ -1421,7 +1436,33 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				keybd_event(wParam, wParam, KEYEVENTF_EXTENDEDKEY, 0);
 
 				return TRUE;
-			}			
+			}
+
+			if (isCtrl && wParam >= 0x30 && wParam <= 0x39 && !getStoredValue(TEXT("disable-num-keys"), 0)) {// 0-9
+				HWND hGridWnd = GetDlgItem(hWnd, IDC_GRID);
+				HWND hHeader = ListView_GetHeader(hGridWnd);
+				int colCount = Header_GetItemCount(ListView_GetHeader(hGridWnd));
+
+				BOOL isCurrent = wParam == 0x30;
+				int colNo = isCurrent ? *(int*)GetProp(hWnd, TEXT("CURRENTCOLNO")) : wParam - 0x30 - 1;
+				if (colNo < 0 || colNo > colCount - 1 || isCurrent && ListView_GetColumnWidth(hGridWnd, colNo) == 0)
+					return FALSE;
+
+				if (!isCurrent) {
+					int* colOrder = calloc(colCount, sizeof(int));
+					Header_GetOrderArray(hHeader, colCount, colOrder);
+
+					int hiddenColCount = 0;
+					for (int idx = 0; (idx < colCount) && (idx - hiddenColCount <= colNo); idx++)
+						hiddenColCount += ListView_GetColumnWidth(hGridWnd, colOrder[idx]) == 0;
+
+					colNo = colOrder[colNo + hiddenColCount];
+					free(colOrder);
+				}
+				
+				SendMessage(hWnd, WMU_SORT_COLUMN, colNo, 0);
+				return TRUE;
+			}
 			
 			return FALSE;					
 		}
@@ -1431,7 +1472,7 @@ LRESULT CALLBACK cbNewMain(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			BOOL isCtrl = HIWORD(GetKeyState(VK_CONTROL));
 
 			unsigned char scancode = ((unsigned char*)&lParam)[2];
-			UINT key = MapVirtualKey(scancode,MAPVK_VSC_TO_VK);
+			UINT key = MapVirtualKey(scancode, MAPVK_VSC_TO_VK);
 
 			return !_istprint(wParam) && (
 				wParam == VK_ESCAPE || wParam == VK_F11 || wParam == VK_F1 ||
